@@ -265,7 +265,15 @@ class BrushStyle:
 # don't model yet. Anything outside this set + the LayerRecord field set
 # raises in `from_row`, so a new CSP version that adds a column gets caught
 # at parse time.
-LAYER_RECORD_IGNORED_COLUMNS = frozenset()
+LAYER_RECORD_IGNORED_COLUMNS = frozenset(
+    {
+        # Text-layer payloads (string runs + per-run attributes). The text is
+        # already baked into the layer's rendered offscreen, which is what we
+        # composite — so we don't model these arrays.
+        "TextLayerStringArray",
+        "TextLayerAttributesArray",
+    }
+)
 
 
 _LAYER_RECORD_FIELD_TO_COLUMN = {

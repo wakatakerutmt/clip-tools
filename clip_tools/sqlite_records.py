@@ -200,6 +200,28 @@ CANVAS_IGNORED_COLUMNS = frozenset(
         "ComicHasDoubleCover",
         "ComicPageIndex",
         "ComicIsLeftPage",
+        # Crop-frame / safe-frame (print trim + safe-area guides). Editorial
+        # overlay geometry; doesn't drive layer rendering.
+        "CropFrameOptionFlag",
+        "CropFrameUnitKind",
+        "CropFrameWidth",
+        "CropFrameHeight",
+        "CropFrameDitch",
+        "CropFrameInnerWidth",
+        "CropFrameInnerHeight",
+        "CropFrameInnerOffsetX",
+        "CropFrameInnerOffsetY",
+        "CropFrameMergeDitch",
+        "CropFrameCropOffsetX",
+        "CropFrameCropOffsetY",
+        "CropFrameSafeMarginLeft",
+        "CropFrameSafeMarginTop",
+        "CropFrameSafeMarginRight",
+        "CropFrameSafeMarginBottom",
+        "CropFrameInnerOffsetBasePosition",
+        "CropFrameDesignationType",
+        "CropFrameShow",
+        "SafeFrameShow",
     }
 )
 
