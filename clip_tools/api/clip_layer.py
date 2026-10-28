@@ -383,6 +383,24 @@ class ClipLayer:
         # subsequent default calls return the forced output.
         if layer_filter is None and not force:
             self._composited = composited
+
+        # Apply this layer's OWN opacity to the output alpha. psd-tools
+        # does this at the Group.composite boundary: a group with
+        # opacity 0.45 returns an RGBA image whose alpha has been
+        # scaled by 0.45, so downstream flattening (e.g. save_jpg's
+        # convert('RGB') onto white) sees the group as semi-transparent.
+        # Without this scaling, calling `bg_layer.composite()` on a
+        # BG group with partial opacity returned alpha=255 (fully
+        # opaque) and the flattened JPG looked saturated / wrong
+        # compared to psd-tools's output of the same source.
+        # Only mutate when a scale is actually needed to avoid a
+        # pointless copy on the common opacity==1.0 path.
+        if composited.shape[-1] >= 4 and self.opacity < 1.0:
+            composited = composited.copy()
+            composited[..., 3] = (
+                composited[..., 3].astype(np.float32) * float(self.opacity)
+            ).astype(np.uint8)
+
         result = arr_to_pil(composited)
 
         if viewport is not None:
@@ -425,9 +443,18 @@ class ClipLayer:
             out[..., :3] = np.where(a > 0, rgb, 0).round().astype(np.uint8)
             return out
 
+        # Transparent backdrop so the output RGBA reflects actual layer
+        # coverage, matching psd-tools's convention (callers flatten onto
+        # white when they want an opaque image — see save_jpg's convert('RGB')).
+        # Previously the buffer was pre-filled with RGB=255, which silently
+        # pre-mixed white into the composite: a semi-transparent BG at 45%
+        # opacity blended with the white backdrop produced
+        # 0.45*BG_rgb + 0.55*white (light pastel) instead of the raw BG
+        # content with alpha=115. When that intermediate was then alpha-
+        # blended with LO on top, the result diverged visibly from
+        # psd-tools's output (seen as mean pixel diff ≈ 45 in the
+        # kakidashi-kun BG_LO parity check).
         buffer = np.zeros((*self._canvas_size, 4), dtype=np.uint8)
-
-        buffer[..., :3] = 255
 
         for i, layer in enumerate(layer_list):
             layer_id = layer.layer_id
