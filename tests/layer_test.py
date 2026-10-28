@@ -74,6 +74,26 @@ class TestTest000:
         for layer in test000_clip:
             assert layer.size == (layer.width, layer.height)
 
+    def test_descendants_flat_tree_matches_iter(self, test000_clip: ClipImage):
+        # test000 has 3 top-level pixel layers and no groups, so
+        # descendants() must yield the same layers as plain iteration.
+        # Deeper nesting is covered by test_descendants_with_fake_group.
+        assert list(test000_clip.descendants()) == list(test000_clip)
+
+    def test_descendants_include_clip_flag_is_noop(self, test000_clip: ClipImage):
+        # CSP's layer model doesn't have the psd-tools "clipping" concept,
+        # so include_clip is accepted-and-ignored for signature parity.
+        # Both values must yield identical sequences.
+        assert list(test000_clip.descendants(include_clip=True)) == list(
+            test000_clip.descendants(include_clip=False)
+        )
+
+    def test_descendants_does_not_yield_self(self, test000_clip: ClipImage):
+        # Matches psd-tools semantics: descendants() iterates descendants,
+        # not the receiver itself. Caller does `[root, *root.descendants()]`
+        # when it wants the full tree including root.
+        assert test000_clip not in list(test000_clip.descendants())
+
     def test_bboxes(self, test000_clip: ClipImage):
         assert [tuple(int(x) for x in l.bbox) for l in test000_clip] == [
             (0, 0, 0, 0),

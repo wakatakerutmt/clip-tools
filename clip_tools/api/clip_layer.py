@@ -228,6 +228,29 @@ class ClipLayer:
     def __len__(self) -> int:
         return len(self._children)
 
+    def descendants(self, include_clip: bool = True) -> Iterator[ClipLayer]:
+        """Depth-first iterator yielding every descendant layer.
+
+        Matches ``psd_tools.PSDImage.descendants`` / ``Group.descendants``
+        in both signature and traversal order: pre-order DFS, children
+        before grandchildren, yields groups and leaves alike. Does not
+        yield ``self``.
+
+        :param include_clip: Kept for signature parity with psd-tools.
+            In psd-tools this filters out adjustment-layer clipping
+            masks; CSP's layer model doesn't have a matching concept
+            so clip-tools accepts and ignores this parameter.
+
+        Example::
+
+            for layer in img.descendants():
+                print(layer.name)
+        """
+        for layer in self:
+            yield layer
+            if layer.is_group():
+                yield from layer.descendants(include_clip=include_clip)
+
     def composite(self, prepended_layers=[]) -> Optional[Image.Image]:
         entry = self._raster.get(self.layer_id)
         meta = self.metadata
