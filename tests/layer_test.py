@@ -94,6 +94,23 @@ class TestTest000:
         # when it wants the full tree including root.
         assert test000_clip not in list(test000_clip.descendants())
 
+    def test_find_returns_matching_layer(self, test000_clip: ClipImage):
+        # test000 layer names: ["用紙", "layer1", "layer2"].
+        found = test000_clip.find("layer1")
+        assert found is not None
+        assert found.name == "layer1"
+
+    def test_find_returns_none_when_absent(self, test000_clip: ClipImage):
+        assert test000_clip.find("nonexistent_layer_name") is None
+
+    def test_find_first_match_wins(self, test000_clip: ClipImage):
+        # test000 has unique names so this only checks the identity of
+        # the returned layer, not the "first" semantics; proper first-
+        # match-wins coverage needs a fixture with duplicate names
+        # (deferred — same fixture gap as descendants' deep-nesting case).
+        found = test000_clip.find("用紙")
+        assert found is test000_clip._children[0]
+
     def test_bboxes(self, test000_clip: ClipImage):
         assert [tuple(int(x) for x in l.bbox) for l in test000_clip] == [
             (0, 0, 0, 0),

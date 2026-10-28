@@ -251,6 +251,24 @@ class ClipLayer:
             if layer.is_group():
                 yield from layer.descendants(include_clip=include_clip)
 
+    def find(self, name: str) -> Optional[ClipLayer]:
+        """Depth-first search for the first descendant with ``name``.
+
+        Matches ``psd_tools.PSDImage.find`` / ``Group.find``: returns the
+        first layer whose ``.name == name`` in DFS pre-order, or ``None``
+        if nothing matches. First match wins — no ambiguity resolution.
+
+        For the "find all layers with this name" case use a comprehension
+        over ``descendants()`` (``[l for l in img.descendants() if l.name == name]``);
+        psd-tools exposes this as ``findall()`` but kakidashi-kun's
+        current consumers only need first-match semantics, so clip-tools
+        starts with the smaller surface here.
+        """
+        for layer in self.descendants():
+            if layer.name == name:
+                return layer
+        return None
+
     def composite(self, prepended_layers=[]) -> Optional[Image.Image]:
         entry = self._raster.get(self.layer_id)
         meta = self.metadata
