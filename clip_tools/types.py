@@ -272,6 +272,9 @@ LAYER_RECORD_IGNORED_COLUMNS = frozenset(
         # composite — so we don't model these arrays.
         "TextLayerStringArray",
         "TextLayerAttributesArray",
+        # Added when CSP started saving a per-text-layer "auto-rename when text
+        # changes" toggle. Pure UI state, has no effect on composite output.
+        "TextLayerNameAutoChangeEnabled",
     }
 )
 
