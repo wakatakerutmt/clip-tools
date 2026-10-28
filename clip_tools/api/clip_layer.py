@@ -142,8 +142,19 @@ class ClipLayer:
 
     @property
     def size(self) -> Tuple[int, int]:
-        """Will return width, height."""
-        return self._canvas_size[::-1][0], self._canvas_size[::-1][1]
+        """Canvas size as ``(width, height)``.
+
+        Matches ``psd_tools.PSDImage.size`` and PIL's ``Image.size`` so
+        downstream consumers reading ``layer.size`` behave the same
+        across PSDImage ↔ ClipImage swaps.
+
+        Note that the backing ``_canvas_size`` stores ``(height, width)``
+        internally (numpy / cv2 convention — see ``ClipImage.open``
+        which assigns ``canvas_size = (canvas_height, canvas_width)``).
+        This property re-orders to the PIL convention so API consumers
+        don't need to know about the internal storage order.
+        """
+        return self.width, self.height
 
     @property
     def width(self) -> int:
