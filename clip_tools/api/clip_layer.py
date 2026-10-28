@@ -141,6 +141,32 @@ class ClipLayer:
         self._record.loc[self._idx, "LayerOpacity"] = int(value * 256)
 
     @property
+    def blend_mode(self) -> LayerComposite:
+        """Per-layer blend mode (``LayerComposite`` enum).
+
+        psd-tools exposes the equivalent as ``.blend_mode`` returning
+        ``psd_tools.constants.BlendMode``. The two enums use different
+        value types (CSP numeric IDs vs PSD 4-byte codes) but their
+        member *names* overlap for every common mode:
+        ``NORMAL / MULTIPLY / SCREEN / OVERLAY / SOFT_LIGHT /
+        HARD_LIGHT / DIFFERENCE / HUE / SATURATION / COLOR / LUMINOSITY
+        / DARKEN / LIGHTEN / COLOR_BURN / LINEAR_BURN / COLOR_DODGE /
+        VIVID_LIGHT / LINEAR_LIGHT / PIN_LIGHT / HARD_MIX / EXCLUSION
+        / SUBTRACT / DIVIDE / PASS_THROUGH / DARKER_COLOR / LIGHTER_COLOR``.
+        Downstream code that only cares about blend mode by name can
+        write ``layer.blend_mode.name`` and get strings that compare
+        1:1 across libraries.
+
+        Falls back to ``LayerComposite.NORMAL`` when the record's
+        ``layer_composite`` field holds a value outside the known
+        enum (matches the fallback inside ``composit_layers``).
+        """
+        try:
+            return LayerComposite(self.metadata.layer_composite)
+        except ValueError:
+            return LayerComposite.NORMAL
+
+    @property
     def size(self) -> Tuple[int, int]:
         """Canvas size as ``(width, height)``.
 
