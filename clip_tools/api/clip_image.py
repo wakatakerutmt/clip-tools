@@ -58,4 +58,4 @@ class ClipImage(ClipLayer):
             base_name, clip_data, dfs, record, external_id_map
         )
 
-        return ClipLayer(record, 0, raster, canvas_size)
+        return cls(record, 0, raster, canvas_size)

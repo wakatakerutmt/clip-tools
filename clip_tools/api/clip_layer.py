@@ -384,15 +384,24 @@ class ClipLayer:
                 result = result.crop(viewport)
             return result
 
-        # Main path: hand off to the new engine. as_layer=True so this call
-        # applies self.opacity (psd-tools default for Group.composite()).
+        # Main path: hand off to the new engine. For a regular group we pass
+        # as_layer=True (psd-tools' Group.composite semantics — applies the
+        # group's own opacity). For the image root (ClipImage, parity with
+        # psd-tools' PSDImage.composite), we pass as_layer=False so the engine
+        # iterates the root's children directly instead of applying the root
+        # as a single layer: a layer_filter passed by the caller is a
+        # children-selector, and treating the root as a single layer would
+        # wrongly gate the whole render on filter(root).
+        from clip_tools.api.clip_image import ClipImage  # noqa: PLC0415
+
+        as_layer = not isinstance(self, ClipImage)
         try:
             result = _composite_pil(
                 self,
                 viewport=viewport,
                 layer_filter=layer_filter,
                 force=force,
-                as_layer=True,
+                as_layer=as_layer,
             )
         except Exception as exc:  # pragma: no cover
             logger.exception("composite engine failed on layer %s: %s", self.name, exc)
