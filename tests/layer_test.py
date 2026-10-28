@@ -58,6 +58,22 @@ class TestTest000:
             assert layer.width == 1400
             assert layer.height == 700
 
+    def test_size_tuple_order(self, test000_clip: ClipImage):
+        # psd-tools / PIL contract: .size == (width, height). The internal
+        # _canvas_size is (height, width) numpy-style, so this test guards
+        # against a regression where .size silently flips to (h, w) and
+        # produces transposed outputs downstream.
+        assert test000_clip.size == (1400, 700)
+        assert test000_clip.size == (test000_clip.width, test000_clip.height)
+        # width-first ordering: index 0 is width, index 1 is height.
+        assert test000_clip.size[0] == test000_clip.width
+        assert test000_clip.size[1] == test000_clip.height
+
+    def test_size_tuple_order_on_descendants(self, test000_clip: ClipImage):
+        # Same contract on every layer.
+        for layer in test000_clip:
+            assert layer.size == (layer.width, layer.height)
+
     def test_bboxes(self, test000_clip: ClipImage):
         assert [tuple(int(x) for x in l.bbox) for l in test000_clip] == [
             (0, 0, 0, 0),
