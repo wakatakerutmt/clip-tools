@@ -165,9 +165,13 @@ CANVAS_IGNORED_COLUMNS = frozenset(
         "TimeLineFrameDisplay",
         "TimeLineEditMode",
         "TimeLineResizeQuality",
+        "TimeLineUseNameFormat",
+        "TimeLineNameFormat",
+        "LightTableReferCommonOpacity",
         # Brush-pattern bookkeeping pointers we don't follow yet.
         "BrushStyleReadProtect070",
         # Comic-story metadata mirrored from Project — not used for rendering.
+        "ComicStoryLayerCreated",
         "ComicStoryStoryName",
         "ComicStoryUseStoryIndex",
         "ComicStoryStoryIndex",
