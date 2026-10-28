@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Tuple, Optional, Iterator
+from typing import Callable, Dict, List, Tuple, Optional, Iterator
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -269,13 +269,49 @@ class ClipLayer:
                 return layer
         return None
 
-    def composite(self, prepended_layers=[]) -> Optional[Image.Image]:
+    def composite(
+        self,
+        viewport: Optional[Tuple[int, int, int, int]] = None,
+        force: bool = False,
+        layer_filter: Optional[Callable[["ClipLayer"], bool]] = None,
+        prepended_layers: Optional[List["ClipLayer"]] = None,
+    ) -> Optional[Image.Image]:
+        """Composite this layer and return the result as a PIL image.
+
+        psd-tools parity: this matches ``PSDImage.composite`` /
+        ``Group.composite`` in both the shape of the keyword arguments and
+        their semantics. Downstream consumers (e.g. kakidashi-kun) can call
+        ``img.composite(viewport=..., force=True, layer_filter=lambda l: ...)``
+        identically against a PSDImage or a ClipImage.
+
+        :param viewport: ``(left, top, right, bottom)`` crop applied to the
+            composited result. ``None`` returns the full canvas.
+        :param force: when True, do not use the per-layer cached recomposite
+            (``self._composited``) nor the group's pre-merged raster as a
+            fallback. Leaf raster/vector entries ARE the layer's content
+            and are always used.
+        :param layer_filter: predicate called on each candidate layer.
+            Only layers for which it returns True participate. Passed down
+            recursively so nested groups also see the filter. ``None``
+            means "no filtering" (all layers participate).
+        :param prepended_layers: layers composited UNDER the children,
+            as a base. Kept for backward compat with the internal recursive
+            composite path.
+        """
+        prepended = list(prepended_layers) if prepended_layers else []
         entry = self._raster.get(self.layer_id)
         meta = self.metadata
 
         if entry is not None and entry.type in ("raster", "vector"):
+            # Leaf raster/vector: this IS the content, not a cache.
+            # psd-tools treats this the same way, so `force` doesn't skip it.
             composited = entry.image
-        elif self._composited is not None:
+        elif self._composited is not None and not force and layer_filter is None:
+            # The _composited cache holds whatever the previous composite
+            # produced, with no record of what filter was used. A new call
+            # that specifies a layer_filter wants a different output, so
+            # the cache must be bypassed — otherwise filtering silently
+            # has no effect after any earlier composite call.
             composited = self._composited
         elif meta.draw_color_enable == 1.0:
             scale = 255.0 / (2**32 - 1)
@@ -288,30 +324,60 @@ class ClipLayer:
         else:
             logger.debug("Composit children:", self.children_names)
 
-            if len(self.children) > 0:
-                layers_to_composit = prepended_layers + self.children
-                composited = self.composit_layers(layers_to_composit)
+            children = list(self._children)
+            if layer_filter is not None:
+                children = [c for c in children if layer_filter(c)]
+
+            if len(children) > 0:
+                layers_to_composit = prepended + children
+                composited = self.composit_layers(
+                    layers_to_composit, layer_filter=layer_filter, force=force
+                )
                 # ClipStudio sometimes flattens group strokes into the group's
                 # own cached raster and leaves child leaves empty. If child
-                # composition produced nothing, fall back to the cached group.
+                # composition produced nothing, fall back to the cached group
+                # — unless `force` asked us to override that pre-merged image.
                 if (
-                    entry is not None
+                    not force
+                    and entry is not None
                     and entry.type == "group"
                     and composited.shape[-1] >= 4
                     and not composited[..., 3].any()
                 ):
                     composited = entry.image
-            elif entry is not None and entry.type == "group":
+            elif entry is not None and entry.type == "group" and not force:
                 composited = entry.image
             else:
                 return None
 
-        self._composited = composited
-        return arr_to_pil(composited)
+        # Only cache the "canonical" result (no filter, no force override).
+        # A filtered composite would poison the cache for later unfiltered
+        # calls, and a forced composite is explicitly asking to override
+        # whatever was there — populating the cache from it would make
+        # subsequent default calls return the forced output.
+        if layer_filter is None and not force:
+            self._composited = composited
+        result = arr_to_pil(composited)
 
-    def composit_layers(self, layer_list: List[ClipLayer]) -> np.ndarray:
-        """
-        layer_list is a list of tuples (id, image)
+        if viewport is not None:
+            # PIL.Image.crop takes (left, upper, right, lower) — matches
+            # psd-tools viewport convention exactly.
+            result = result.crop(viewport)
+
+        return result
+
+    def composit_layers(
+        self,
+        layer_list: List[ClipLayer],
+        layer_filter: Optional[Callable[["ClipLayer"], bool]] = None,
+        force: bool = False,
+    ) -> np.ndarray:
+        """Composite a list of layers against a white backdrop and return RGBA.
+
+        Internal method called by :py:meth:`composite` when a group needs to
+        render its children. ``layer_filter`` and ``force`` are forwarded to
+        each child's own ``composite()`` call so filtering and cache-skipping
+        propagate through nested groups.
         """
 
         def layer_composite(meta: LayerRecord) -> LayerComposite:
@@ -340,7 +406,9 @@ class ClipLayer:
         for i, layer in enumerate(layer_list):
             layer_id = layer.layer_id
             layer_type = layer.layer_type
-            layer_img = np.array(layer.composite())
+            layer_img = np.array(
+                layer.composite(layer_filter=layer_filter, force=force)
+            )
 
             if len(layer_img.shape) == 0:
                 continue
