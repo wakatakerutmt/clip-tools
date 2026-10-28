@@ -275,6 +275,16 @@ LAYER_RECORD_IGNORED_COLUMNS = frozenset(
         # Added when CSP started saving a per-text-layer "auto-rename when text
         # changes" toggle. Pure UI state, has no effect on composite output.
         "TextLayerNameAutoChangeEnabled",
+        # Newer CSP columns surfaced during end-to-end verification against
+        # real CSP EX .clip files. None of these influence the final composite
+        # (resize baseline cache, external-link bookkeeping, crop frame UI
+        # state, animation light-table reference). Added as a batch so a
+        # single open() call doesn't fail iteratively.
+        "ResizableOriginalMipmap",
+        "LinkLayerUUID",
+        "LinkLayerStatus",
+        "CropFrame",
+        "LightTableReferCell",
     }
 )
 
