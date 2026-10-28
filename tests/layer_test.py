@@ -143,6 +143,29 @@ class TestTest000:
         assert img is not None
         assert img.size == test000_clip.size
 
+    def test_blend_mode_returns_layer_composite_enum(self, test000_clip: ClipImage):
+        from clip_tools.constants import LayerComposite
+
+        for layer in test000_clip:
+            assert isinstance(layer.blend_mode, LayerComposite)
+
+    def test_blend_mode_default_is_normal(self, test000_clip: ClipImage):
+        from clip_tools.constants import LayerComposite
+
+        # test000 has only plain raster layers with no explicit blend mode set
+        # — they should all return the default NORMAL.
+        for layer in test000_clip:
+            assert layer.blend_mode == LayerComposite.NORMAL
+
+    def test_blend_mode_name_overlaps_psd_tools(self, test000_clip: ClipImage):
+        # psd-tools parity: the enum member *names* overlap even though the
+        # value types differ. Downstream code compares via ``.name`` or
+        # ``.name == "MULTIPLY"`` and gets portable semantics.
+        from psd_tools.constants import BlendMode
+
+        for layer in test000_clip:
+            assert layer.blend_mode.name in BlendMode.__members__
+
     def test_find_first_match_wins(self, test000_clip: ClipImage):
         # test000 has unique names so this only checks the identity of
         # the returned layer, not the "first" semantics; proper first-
