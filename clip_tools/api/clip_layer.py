@@ -146,6 +146,24 @@ class ClipLayer:
         return self._canvas_size[::-1][0], self._canvas_size[::-1][1]
 
     @property
+    def width(self) -> int:
+        """Canvas width in pixels.
+
+        Matches ``psd_tools.PSDImage.width`` / ``Layer.width`` so downstream
+        consumers that iterate ``layer.width`` interchangeably across both
+        libraries work unchanged. For now descendant layers inherit the
+        canvas width — a per-layer bbox-derived width will follow once
+        bbox returns proper right/bottom coordinates (see
+        ``ClipLayer.bbox`` which currently returns zeros for the extent).
+        """
+        return int(self._canvas_size[1])
+
+    @property
+    def height(self) -> int:
+        """Canvas height in pixels. See :pyattr:`width` for scope notes."""
+        return int(self._canvas_size[0])
+
+    @property
     def bbox(self) -> Tuple[int, int, int, int]:
         meta = self.metadata
 

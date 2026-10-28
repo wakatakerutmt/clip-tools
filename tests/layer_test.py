@@ -41,6 +41,23 @@ class TestTest000:
     def test_all_visible(self, test000_clip: ClipImage):
         assert all(bool(l.visible) for l in test000_clip)
 
+    def test_width_height(self, test000_clip: ClipImage):
+        # test000 canvas is stored as _canvas_size == (height=700, width=1400).
+        # psd-tools parity: expose width / height as ints matching the PIL
+        # convention so downstream code can swap PSDImage ↔ ClipImage.
+        assert test000_clip.width == 1400
+        assert test000_clip.height == 700
+        assert isinstance(test000_clip.width, int)
+        assert isinstance(test000_clip.height, int)
+
+    def test_width_height_on_descendants(self, test000_clip: ClipImage):
+        # Descendants inherit the canvas width/height for now. Per-layer
+        # bbox-derived size is future work tied to ClipLayer.bbox returning
+        # proper right/bottom coordinates (currently (x, y, 0, 0)).
+        for layer in test000_clip:
+            assert layer.width == 1400
+            assert layer.height == 700
+
     def test_bboxes(self, test000_clip: ClipImage):
         assert [tuple(int(x) for x in l.bbox) for l in test000_clip] == [
             (0, 0, 0, 0),
