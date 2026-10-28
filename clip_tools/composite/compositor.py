@@ -182,7 +182,7 @@ class Compositor:
                 return None, None, None
             rgba = _crop_to_viewport(solid, self._viewport)
         else:
-            rgba = _raster_to_float32(raster, layer._canvas_size)
+            rgba = _place_raster_on_canvas(raster, layer._canvas_size, layer.bbox[:2])
             rgba = _crop_to_viewport(rgba, self._viewport)
         color = rgba[..., :3].astype(np.float32, copy=False)
         alpha = rgba[..., 3:4].astype(np.float32, copy=False)
@@ -305,17 +305,28 @@ def _leaf_raster(layer) -> Optional[np.ndarray]:
     return None
 
 
-def _raster_to_float32(arr: np.ndarray, canvas_size) -> np.ndarray:
-    """Convert a uint8 (or similar) raster to a canvas-sized float32 (H, W, 4) in [0,1]."""
+def _place_raster_on_canvas(
+    arr: np.ndarray,
+    canvas_size,
+    offset_xy: Tuple[int, int] = (0, 0),
+) -> np.ndarray:
+    """Convert a uint8 raster to canvas-sized float32 (H, W, 4) in [0, 1],
+    placing it at ``offset_xy = (offset_x, offset_y)`` within the canvas.
+
+    Ports the clipping logic from the old ``composit_layers``: when the
+    raster extends past a canvas edge (negative offset or image larger
+    than remaining space), the overflowing portion is cropped so the
+    visible region is placed at the right spot. CSP writes layer images
+    larger than the canvas when the painted content extends off-canvas,
+    so a top-left-origin paste would wrongly show the off-canvas region.
+    """
     arr_f = arr.astype(np.float32)
     if arr.dtype == np.uint8:
         arr_f = arr_f / 255.0
     elif arr_f.max() > 1.0 + 1e-6:
-        # Defensive: fall back to divide-by-255 if max suggests uint8-like range.
         arr_f = arr_f / 255.0
 
-    # Ensure (H, W, 4). PIL "L" / "LA" single-channel rasters are not expected
-    # here (clip-tools stores raster entries as RGBA), but guard anyway.
+    # Normalize channel count to RGBA.
     if arr_f.ndim == 2:
         arr_f = np.stack([arr_f, arr_f, arr_f, np.full_like(arr_f, 1.0)], axis=2)
     elif arr_f.shape[2] == 3:
@@ -323,16 +334,38 @@ def _raster_to_float32(arr: np.ndarray, canvas_size) -> np.ndarray:
         arr_f = np.concatenate([arr_f, alpha], axis=2)
 
     h_c, w_c = canvas_size
-    h_i, w_i = arr_f.shape[:2]
-    if (h_i, w_i) == (h_c, w_c):
-        return arr_f
-    # Pad / crop to canvas size (top-left origin). clip-tools' current code
-    # pastes layer images onto a canvas-sized buffer with top-left offset
-    # elsewhere; here we match that until explicit offset handling lands.
     canvas = np.zeros((h_c, w_c, 4), dtype=np.float32)
-    h = min(h_i, h_c)
-    w = min(w_i, w_c)
-    canvas[:h, :w] = arr_f[:h, :w]
+
+    offset_x, offset_y = int(offset_xy[0]), int(offset_xy[1])
+    img_h, img_w = arr_f.shape[:2]
+
+    # X clipping — mirror the old composit_layers logic for signed offsets.
+    if offset_x < 0:
+        src_x0 = -offset_x
+        dst_x0 = 0
+    else:
+        src_x0 = 0
+        dst_x0 = offset_x
+    src_x1 = min(img_w, src_x0 + (w_c - dst_x0))
+    width = src_x1 - src_x0
+    if width <= 0:
+        return canvas
+    dst_x1 = dst_x0 + width
+
+    # Y clipping — same pattern.
+    if offset_y < 0:
+        src_y0 = -offset_y
+        dst_y0 = 0
+    else:
+        src_y0 = 0
+        dst_y0 = offset_y
+    src_y1 = min(img_h, src_y0 + (h_c - dst_y0))
+    height = src_y1 - src_y0
+    if height <= 0:
+        return canvas
+    dst_y1 = dst_y0 + height
+
+    canvas[dst_y0:dst_y1, dst_x0:dst_x1] = arr_f[src_y0:src_y1, src_x0:src_x1]
     return canvas
 
 
