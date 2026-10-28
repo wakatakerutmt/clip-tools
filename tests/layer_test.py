@@ -103,6 +103,46 @@ class TestTest000:
     def test_find_returns_none_when_absent(self, test000_clip: ClipImage):
         assert test000_clip.find("nonexistent_layer_name") is None
 
+    def test_composite_backward_compat_no_kwargs(
+        self, test000_clip: ClipImage, test000_ground_truth: np.ndarray
+    ):
+        # Explicit backward-compat guard: composite() with no kwargs still
+        # produces the same golden output as before the signature change.
+        assert np.array_equal(np.array(test000_clip.composite()), test000_ground_truth)
+
+    def test_composite_viewport_crops_output(self, test000_clip: ClipImage):
+        # viewport=(left, top, right, bottom) crops the composited result.
+        # test000 canvas is 1400x700, so a 100x50 crop should yield a 100x50 image.
+        img = test000_clip.composite(viewport=(10, 20, 110, 70))
+        assert img is not None
+        assert img.size == (100, 50)
+
+    def test_composite_layer_filter_all_pass_matches_default(
+        self, test000_clip: ClipImage, test000_ground_truth: np.ndarray
+    ):
+        # layer_filter=lambda _: True is equivalent to no filter — every
+        # layer still participates, output matches the golden.
+        all_passed = test000_clip.composite(layer_filter=lambda layer: True)
+        assert all_passed is not None
+        assert np.array_equal(np.array(all_passed), test000_ground_truth)
+
+    def test_composite_layer_filter_all_block_returns_none(
+        self, test000_clip: ClipImage
+    ):
+        # When every candidate layer is filtered out and there's no cached
+        # group raster or prepended base, there's nothing to composite —
+        # returns None, matching the existing "empty children" code path.
+        all_blocked = test000_clip.composite(layer_filter=lambda layer: False)
+        assert all_blocked is None
+
+    def test_composite_force_runs_without_error(self, test000_clip: ClipImage):
+        # Smoke test: force=True on a flat 3-pixel tree completes successfully
+        # (deeper cache-skipping assertions need a group-with-cached-raster
+        # fixture; same deferral as #3's deep-nesting case).
+        img = test000_clip.composite(force=True)
+        assert img is not None
+        assert img.size == test000_clip.size
+
     def test_find_first_match_wins(self, test000_clip: ClipImage):
         # test000 has unique names so this only checks the identity of
         # the returned layer, not the "first" semantics; proper first-
