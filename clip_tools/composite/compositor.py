@@ -220,9 +220,22 @@ class Compositor:
     def _get_const(self, layer) -> Tuple[float, float]:
         """(shape_const=fill_opacity, opacity_const=layer_opacity).
 
-        clip-tools has no fill_opacity concept; return (1.0, layer.opacity).
+        clip-tools has no fill_opacity concept; return (1.0, layer_opacity).
+
+        We bypass ``ClipLayer.opacity`` (which divides by 256, matching
+        CSP's internal 0-256 integer scale) and use /255 effective scale
+        here. CSP stores LayerOpacity as 0-256 but when it exports to PSD
+        the same byte value shifts semantics to /255. For byte-exact
+        parity with psd-tools output we need the same /255 interpretation
+        at composite time; the public ``layer.opacity`` property keeps
+        /256 for CSP-format fidelity.
         """
-        opacity = float(getattr(layer, "opacity", 1.0) or 0.0)
+        raw = getattr(layer.metadata, "layer_opacity", 256)
+        try:
+            raw_i = int(raw) if raw is not None else 256
+        except (TypeError, ValueError):
+            raw_i = 256
+        opacity = min(raw_i, 255) / 255.0
         return 1.0, opacity
 
     # ---- Porter-Duff + blend merge ------------------------------------
