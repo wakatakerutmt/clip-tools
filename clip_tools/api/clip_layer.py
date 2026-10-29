@@ -9,6 +9,7 @@ from PIL import Image
 import logging
 
 from clip_tools.blending import composite_layer
+from clip_tools.composite import composite_pil as _composite_pil
 from clip_tools.constants import DEBUG, LayerComposite, LayerFolderBit, LayerLockBit
 from clip_tools.structs import (
     process_text_attributes,
@@ -324,22 +325,23 @@ class ClipLayer:
             as a base. Kept for backward compat with the internal recursive
             composite path.
         """
+        # Delegate to the new clip_tools.composite engine (port of psd-tools'
+        # Compositor). The engine handles leaf / group / pass-through / knockout
+        # uniformly with (color, shape, alpha) float32 + Porter-Duff over, so
+        # the only paths we still inline here are:
+        #   - draw_color_enable solid fills (no raster entry to feed the engine)
+        #   - the group-raster fallback (ClipStudio flattens group strokes into
+        #     the group's own cached raster and leaves child leaves empty)
+        #
+        # `prepended_layers` is kept for backward compat with the internal
+        # recursion but is no longer used by the engine; a non-empty value
+        # falls back to the old composit_layers path.
         prepended = list(prepended_layers) if prepended_layers else []
         entry = self._raster.get(self.layer_id)
         meta = self.metadata
 
-        if entry is not None and entry.type in ("raster", "vector"):
-            # Leaf raster/vector: this IS the content, not a cache.
-            # psd-tools treats this the same way, so `force` doesn't skip it.
-            composited = entry.image
-        elif self._composited is not None and not force and layer_filter is None:
-            # The _composited cache holds whatever the previous composite
-            # produced, with no record of what filter was used. A new call
-            # that specifies a layer_filter wants a different output, so
-            # the cache must be bypassed — otherwise filtering silently
-            # has no effect after any earlier composite call.
-            composited = self._composited
-        elif meta.draw_color_enable == 1.0:
+        # Solid-color fill: no raster to feed the engine.
+        if entry is None and meta.draw_color_enable == 1.0:
             scale = 255.0 / (2**32 - 1)
             red = scale * (meta.draw_color_main_red or 0.0)
             green = scale * (meta.draw_color_main_green or 0.0)
@@ -347,66 +349,85 @@ class ClipLayer:
             bg_color = np.array([red, green, blue, 255], dtype=np.uint8)
             composited = np.zeros((*self._canvas_size, 4), dtype=np.uint8)
             composited[..., :4] = bg_color
-        else:
-            logger.debug("Composit children:", self.children_names)
+            # Apply self.opacity for parity with group-call semantics.
+            if self.opacity < 1.0:
+                composited = composited.copy()
+                composited[..., 3] = (
+                    composited[..., 3].astype(np.float32) * float(self.opacity)
+                ).astype(np.uint8)
+            result = arr_to_pil(composited)
+            if viewport is not None:
+                result = result.crop(viewport)
+            return result
 
+        # Prepended-layers path: internal recursive callers rely on the
+        # old composit_layers behaviour (compositing a stack of ad-hoc
+        # layers under the group's children). Keep the pre-engine code
+        # for those cases; external callers never pass prepended_layers.
+        if prepended:
             children = list(self._children)
             if layer_filter is not None:
                 children = [c for c in children if layer_filter(c)]
-
-            if len(children) > 0:
-                layers_to_composit = prepended + children
-                composited = self.composit_layers(
-                    layers_to_composit, layer_filter=layer_filter, force=force
-                )
-                # ClipStudio sometimes flattens group strokes into the group's
-                # own cached raster and leaves child leaves empty. If child
-                # composition produced nothing, fall back to the cached group
-                # — unless `force` asked us to override that pre-merged image.
-                if (
-                    not force
-                    and entry is not None
-                    and entry.type == "group"
-                    and composited.shape[-1] >= 4
-                    and not composited[..., 3].any()
-                ):
-                    composited = entry.image
-            elif entry is not None and entry.type == "group" and not force:
-                composited = entry.image
-            else:
+            if not children:
                 return None
+            layers_to_composit = prepended + children
+            composited = self.composit_layers(
+                layers_to_composit, layer_filter=layer_filter, force=force
+            )
+            if composited.shape[-1] >= 4 and self.opacity < 1.0:
+                composited = composited.copy()
+                composited[..., 3] = (
+                    composited[..., 3].astype(np.float32) * float(self.opacity)
+                ).astype(np.uint8)
+            result = arr_to_pil(composited)
+            if viewport is not None:
+                result = result.crop(viewport)
+            return result
 
-        # Only cache the "canonical" result (no filter, no force override).
-        # A filtered composite would poison the cache for later unfiltered
-        # calls, and a forced composite is explicitly asking to override
-        # whatever was there — populating the cache from it would make
-        # subsequent default calls return the forced output.
-        if layer_filter is None and not force:
-            self._composited = composited
+        # Main path: hand off to the new engine. For a regular group we pass
+        # as_layer=True (psd-tools' Group.composite semantics — applies the
+        # group's own opacity). For the image root (ClipImage, parity with
+        # psd-tools' PSDImage.composite), we pass as_layer=False so the engine
+        # iterates the root's children directly instead of applying the root
+        # as a single layer: a layer_filter passed by the caller is a
+        # children-selector, and treating the root as a single layer would
+        # wrongly gate the whole render on filter(root).
+        from clip_tools.api.clip_image import ClipImage  # noqa: PLC0415
 
-        # Apply this layer's OWN opacity to the output alpha. psd-tools
-        # does this at the Group.composite boundary: a group with
-        # opacity 0.45 returns an RGBA image whose alpha has been
-        # scaled by 0.45, so downstream flattening (e.g. save_jpg's
-        # convert('RGB') onto white) sees the group as semi-transparent.
-        # Without this scaling, calling `bg_layer.composite()` on a
-        # BG group with partial opacity returned alpha=255 (fully
-        # opaque) and the flattened JPG looked saturated / wrong
-        # compared to psd-tools's output of the same source.
-        # Only mutate when a scale is actually needed to avoid a
-        # pointless copy on the common opacity==1.0 path.
-        if composited.shape[-1] >= 4 and self.opacity < 1.0:
-            composited = composited.copy()
-            composited[..., 3] = (
-                composited[..., 3].astype(np.float32) * float(self.opacity)
-            ).astype(np.uint8)
+        as_layer = not isinstance(self, ClipImage)
+        try:
+            result = _composite_pil(
+                self,
+                viewport=viewport,
+                layer_filter=layer_filter,
+                force=force,
+                as_layer=as_layer,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("composite engine failed on layer %s: %s", self.name, exc)
+            raise
 
-        result = arr_to_pil(composited)
-
-        if viewport is not None:
-            # PIL.Image.crop takes (left, upper, right, lower) — matches
-            # psd-tools viewport convention exactly.
-            result = result.crop(viewport)
+        # Group-raster fallback: when a group's child composite produced a
+        # fully transparent image but ClipStudio cached a pre-merged raster,
+        # prefer the cached raster (unless `force` requested a fresh render).
+        if (
+            not force
+            and entry is not None
+            and entry.type == "group"
+            and isinstance(result, Image.Image)
+            and result.mode == "RGBA"
+        ):
+            alpha_arr = np.asarray(result.split()[-1])
+            if not alpha_arr.any():
+                fallback = entry.image
+                if self.opacity < 1.0:
+                    fallback = fallback.copy()
+                    fallback[..., 3] = (
+                        fallback[..., 3].astype(np.float32) * float(self.opacity)
+                    ).astype(np.uint8)
+                result = arr_to_pil(fallback)
+                if viewport is not None:
+                    result = result.crop(viewport)
 
         return result
 
