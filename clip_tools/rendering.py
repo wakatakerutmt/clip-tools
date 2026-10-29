@@ -1142,11 +1142,50 @@ def render_vector_line_stamp(
 
         # Per-stroke alpha accumulator (disc brushes) or full RGBA for textured
         # brushes that still composite each stamp directly.
-        stroke_alpha = (
-            np.zeros((canvas_h * ss, canvas_w * ss), dtype=np.float32)
-            if use_analytic_disc
-            else None
-        )
+        #
+        # The accumulator is sized to the stroke's bounding box, not the full
+        # canvas: ``composite_alpha_onto`` runs Porter-Duff over the whole
+        # accumulator at the end, so a full-canvas buffer makes every stroke
+        # pay the full-image cost regardless of how small the stroke is.
+        # For a Y4-class file this swings the per-blob render from ~23 s
+        # (30 strokes × a 9352×8600 full composite each) to a few seconds.
+        if use_analytic_disc and samples:
+            xs = [s.x * ss for s in samples]
+            ys = [s.y * ss for s in samples]
+            max_s_size = max((s.size for s in samples), default=1.0)
+            # Upper bound on stamp radius for the whole stroke. The actual
+            # per-stamp size is
+            #     effective_size × size_mult × s.size × texture_scale × shaped_scale
+            # where size_mult comes from the size-effector chain (typically
+            # peaks near 2.0 for pressure-driven brushes) and can be replaced
+            # by ``s.size`` when the per-control lock_size bit is set — the
+            # latter contributes a second ``s.size`` factor. Guard both with
+            # a 4.0 cap and ``max_s_size²`` so this bbox stays correct even
+            # for brushes with aggressive size curves without doing an extra
+            # scan over samples. +4 covers AA bleed and rotation diagonal.
+            max_stamp_radius = (
+                effective_size
+                * 4.0
+                * max(1.0, max_s_size) ** 2
+                * max(1.0, float(brush.texture_scale))
+                * shaped_scale
+                / 2.0
+                + 4.0
+            )
+            sx0 = max(0, int(np.floor(min(xs) - max_stamp_radius)))
+            sy0 = max(0, int(np.floor(min(ys) - max_stamp_radius)))
+            sx1 = min(canvas_w * ss, int(np.ceil(max(xs) + max_stamp_radius)))
+            sy1 = min(canvas_h * ss, int(np.ceil(max(ys) + max_stamp_radius)))
+            if sx1 <= sx0 or sy1 <= sy0:
+                # Stroke lives entirely off-canvas — nothing to do.
+                continue
+            stroke_alpha_h = sy1 - sy0
+            stroke_alpha_w = sx1 - sx0
+            stroke_alpha = np.zeros((stroke_alpha_h, stroke_alpha_w), dtype=np.float32)
+            stroke_alpha_origin = (sx0, sy0)
+        else:
+            stroke_alpha = None
+            stroke_alpha_origin = (0, 0)
 
         def draw_stamp(s: VectorSample, tangent_rad: float) -> float:
             """Returns the per-stamp size so the caller can adjust step_px."""
@@ -1186,10 +1225,13 @@ def render_vector_line_stamp(
                 # accumulation so their falloff tails build up opacity along
                 # the stroke. Hard pens use MAX to avoid per-stamp AA boundaries
                 # inside the silhouette.
+                #
+                # Coordinates are relative to the stroke_alpha buffer, which
+                # is sized to the stroke bbox rather than the full canvas.
                 disc_alpha_into(
                     stroke_alpha,
-                    s.x * ss,
-                    s.y * ss,
+                    s.x * ss - stroke_alpha_origin[0],
+                    s.y * ss - stroke_alpha_origin[1],
                     rx,
                     ry,
                     brush.hardness,
@@ -1248,8 +1290,13 @@ def render_vector_line_stamp(
 
         # For disc-stamped strokes we accumulated a silhouette via MAX; now
         # alpha-composite it onto the main buffer as a single solid-color pass.
+        # Only the bbox slice of ``buf`` participates — stroke_alpha is
+        # already sized to that bbox.
         if use_analytic_disc and stroke_alpha is not None:
-            composite_alpha_onto(buf, stroke_alpha, color)
+            sx0, sy0 = stroke_alpha_origin
+            sh, sw = stroke_alpha.shape
+            buf_region = buf[sy0 : sy0 + sh, sx0 : sx0 + sw]
+            composite_alpha_onto(buf_region, stroke_alpha, color)
 
     if ss > 1:
         buf = buf.reshape(canvas_h, ss, canvas_w, ss, 4).mean(axis=(1, 3))
