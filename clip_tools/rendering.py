@@ -1056,6 +1056,13 @@ def render_vector_line_stamp(
     buf = np.zeros((canvas_h * ss, canvas_w * ss, 4), dtype=np.float32)
     skipped: List[VectorStroke] = []
 
+    # Union bbox across every stroke that actually paints into ``buf`` (in
+    # supersampled coords). Used at the end to skip the ss-reduce + uint8
+    # cast on untouched regions of the canvas, which for a vector-heavy
+    # file with localized strokes (Y4) dominates the remaining time after
+    # the per-stroke bbox allocation win.
+    blob_bbox: Optional[List[int]] = None
+
     for st in strokes:
         color = st.color
         brush_size = st.brush_size
@@ -1140,48 +1147,67 @@ def render_vector_line_stamp(
         rng = np.random.default_rng(seed=seed)
         base_rot = np.deg2rad(brush.rotation_base)
 
-        # Per-stroke alpha accumulator (disc brushes) or full RGBA for textured
-        # brushes that still composite each stamp directly.
+        # Compute the stroke's bounding box in supersampled coordinates. The
+        # bbox serves two purposes:
+        #   1) sizes the per-stroke alpha accumulator on the disc path so
+        #      the final composite_alpha_onto runs only over the touched
+        #      region (round-1 of #19)
+        #   2) feeds the blob-wide union bbox so the final ss-reduce and
+        #      uint8 cast skip the untouched regions of the canvas
+        #      (round-2 of #19)
         #
-        # The accumulator is sized to the stroke's bounding box, not the full
-        # canvas: ``composite_alpha_onto`` runs Porter-Duff over the whole
-        # accumulator at the end, so a full-canvas buffer makes every stroke
-        # pay the full-image cost regardless of how small the stroke is.
-        # For a Y4-class file this swings the per-blob render from ~23 s
-        # (30 strokes × a 9352×8600 full composite each) to a few seconds.
-        if use_analytic_disc and samples:
-            xs = [s.x * ss for s in samples]
-            ys = [s.y * ss for s in samples]
-            max_s_size = max((s.size for s in samples), default=1.0)
-            # Upper bound on stamp radius for the whole stroke. The actual
-            # per-stamp size is
-            #     effective_size × size_mult × s.size × texture_scale × shaped_scale
-            # where size_mult comes from the size-effector chain (typically
-            # peaks near 2.0 for pressure-driven brushes) and can be replaced
-            # by ``s.size`` when the per-control lock_size bit is set — the
-            # latter contributes a second ``s.size`` factor. Guard both with
-            # a 4.0 cap and ``max_s_size²`` so this bbox stays correct even
-            # for brushes with aggressive size curves without doing an extra
-            # scan over samples. +4 covers AA bleed and rotation diagonal.
-            max_stamp_radius = (
-                effective_size
-                * 4.0
-                * max(1.0, max_s_size) ** 2
-                * max(1.0, float(brush.texture_scale))
-                * shaped_scale
-                / 2.0
-                + 4.0
-            )
-            sx0 = max(0, int(np.floor(min(xs) - max_stamp_radius)))
-            sy0 = max(0, int(np.floor(min(ys) - max_stamp_radius)))
-            sx1 = min(canvas_w * ss, int(np.ceil(max(xs) + max_stamp_radius)))
-            sy1 = min(canvas_h * ss, int(np.ceil(max(ys) + max_stamp_radius)))
-            if sx1 <= sx0 or sy1 <= sy0:
-                # Stroke lives entirely off-canvas — nothing to do.
-                continue
-            stroke_alpha_h = sy1 - sy0
-            stroke_alpha_w = sx1 - sx0
-            stroke_alpha = np.zeros((stroke_alpha_h, stroke_alpha_w), dtype=np.float32)
+        # The upper bound on stamp radius has to cover every possible stamp
+        # the loop below might lay down:
+        #     actual = effective_size × size_mult × s.size × texture_scale × shaped_scale
+        # ``size_mult`` comes from the size-effector chain (typically peaks
+        # near 2.0 for pressure-driven brushes) and gets replaced by ``s.size``
+        # itself when a sample has the per-control lock_size bit — that
+        # replacement adds a second ``s.size`` factor. Guard both with a
+        # 4.0 cap on size_mult and ``max_s_size²`` so the bbox stays correct
+        # even for aggressive size curves without re-scanning the samples.
+        # ``+4`` absorbs AA bleed and the elliptical rotation diagonal.
+        if not samples:
+            continue
+        xs = [s.x * ss for s in samples]
+        ys = [s.y * ss for s in samples]
+        max_s_size = max((s.size for s in samples), default=1.0)
+        max_stamp_radius = (
+            effective_size
+            * 4.0
+            * max(1.0, max_s_size) ** 2
+            * max(1.0, float(brush.texture_scale))
+            * shaped_scale
+            / 2.0
+            + 4.0
+        )
+        sx0 = max(0, int(np.floor(min(xs) - max_stamp_radius)))
+        sy0 = max(0, int(np.floor(min(ys) - max_stamp_radius)))
+        sx1 = min(canvas_w * ss, int(np.ceil(max(xs) + max_stamp_radius)))
+        sy1 = min(canvas_h * ss, int(np.ceil(max(ys) + max_stamp_radius)))
+        if sx1 <= sx0 or sy1 <= sy0:
+            # Stroke lives entirely off-canvas — nothing to do.
+            continue
+
+        # Grow the blob-level union bbox regardless of brush type. The
+        # textured path paints straight into ``buf`` so the stroke itself
+        # doesn't allocate anything bbox-shaped, but the final ss-reduce
+        # still needs to know the touched region.
+        if blob_bbox is None:
+            blob_bbox = [sx0, sy0, sx1, sy1]
+        else:
+            if sx0 < blob_bbox[0]:
+                blob_bbox[0] = sx0
+            if sy0 < blob_bbox[1]:
+                blob_bbox[1] = sy0
+            if sx1 > blob_bbox[2]:
+                blob_bbox[2] = sx1
+            if sy1 > blob_bbox[3]:
+                blob_bbox[3] = sy1
+
+        # Per-stroke alpha accumulator (disc brushes only; textured brushes
+        # composite each stamp directly into ``buf``).
+        if use_analytic_disc:
+            stroke_alpha = np.zeros((sy1 - sy0, sx1 - sx0), dtype=np.float32)
             stroke_alpha_origin = (sx0, sy0)
         else:
             stroke_alpha = None
@@ -1298,13 +1324,42 @@ def render_vector_line_stamp(
             buf_region = buf[sy0 : sy0 + sh, sx0 : sx0 + sw]
             composite_alpha_onto(buf_region, stroke_alpha, color)
 
-    if ss > 1:
-        buf = buf.reshape(canvas_h, ss, canvas_w, ss, 4).mean(axis=(1, 3))
-    # CLIP converts coverage→alpha as ``min(255, floor(alpha * 256))``, which
-    # matches its internal ``coverage >> 7`` (15-bit coverage down to 8-bit).
-    # This differs by one unit from the naïve ``alpha * 255`` at most alpha
-    # values.
-    rendered = np.minimum(255, (buf * 256).astype(np.int32)).astype(np.uint8)
+    # Finalize the raster. For a vector-heavy file whose strokes only cover
+    # a small region of the canvas, the full-canvas ss-reduce and uint8
+    # cast dominate the remaining time (post round-1 of #19) because they
+    # touch every pixel regardless of whether a stroke painted there. Use
+    # ``blob_bbox`` to limit both passes to the union of all stroke bboxes;
+    # untouched regions are already zeros in ``buf`` and stay zeros in the
+    # output.
+    #
+    # CLIP's coverage→alpha conversion is ``min(255, floor(alpha * 256))``
+    # — matches its internal ``coverage >> 7`` (15-bit coverage into 8-bit).
+    # Differs by one unit from the naïve ``alpha * 255`` at most alpha values.
+    rendered = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
+    if blob_bbox is not None:
+        # Align the union bbox outward to supersample tile boundaries so
+        # the reshape math works. Division is in supersampled space.
+        bx0, by0, bx1, by1 = blob_bbox
+        ub_x0 = (bx0 // ss) * ss
+        ub_y0 = (by0 // ss) * ss
+        ub_x1 = min(canvas_w * ss, -(-bx1 // ss) * ss)
+        ub_y1 = min(canvas_h * ss, -(-by1 // ss) * ss)
+        if ub_x1 > ub_x0 and ub_y1 > ub_y0:
+            region_h = (ub_y1 - ub_y0) // ss
+            region_w = (ub_x1 - ub_x0) // ss
+            if ss > 1:
+                reduced = (
+                    buf[ub_y0:ub_y1, ub_x0:ub_x1]
+                    .reshape(region_h, ss, region_w, ss, 4)
+                    .mean(axis=(1, 3))
+                )
+            else:
+                reduced = buf[ub_y0:ub_y1, ub_x0:ub_x1]
+            # Final uint8 cast on just the painted region.
+            rendered[
+                ub_y0 // ss : ub_y0 // ss + region_h,
+                ub_x0 // ss : ub_x0 // ss + region_w,
+            ] = np.minimum(255, (reduced * 256).astype(np.int32)).astype(np.uint8)
     return rendered, skipped
 
 
