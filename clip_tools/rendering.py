@@ -34,6 +34,17 @@ from clip_tools.types import BrushStyle, VectorPoint, VectorSample, VectorStroke
 logger = logging.getLogger(__name__)
 
 
+# Optional Cython kernel: batches the per-stamp inner loop for circular
+# disc stamps (hard + soft) so the Python call per stamp is replaced with
+# one native call per stroke. Build happens in setup.py (``cythonize``);
+# if the compiled module isn't present we fall back to the pure-numpy
+# per-stamp path. Elliptical / textured stamps always take the fallback.
+try:
+    from clip_tools._rendering_fast import stamp_discs_circular as _stamp_discs_fast
+except ImportError:
+    _stamp_discs_fast = None
+
+
 # -----------------------------------------------------------------------------
 # Brush pattern extraction: follows BrushPatternImage → Mipmap → Offscreen chain
 # -----------------------------------------------------------------------------
@@ -1216,6 +1227,20 @@ def render_vector_line_stamp(
             stroke_alpha = None
             stroke_alpha_origin = (0, 0)
 
+        # Cython fast path: for circular analytic-disc strokes, collect
+        # the per-stamp (cx, cy, radius, opacity) during the step loop
+        # and hand them to the Cython batch kernel in one call after the
+        # loop. Replaces thousands of per-stamp numpy allocations with
+        # a single native-level inner loop. The elliptical path (chisel
+        # brushes) keeps the per-stamp numpy fallback.
+        use_fast_disc = (
+            use_analytic_disc and _stamp_discs_fast is not None and not elliptical
+        )
+        fast_cxs: List[float] = []
+        fast_cys: List[float] = []
+        fast_radii: List[float] = []
+        fast_opacities: List[float] = []
+
         def draw_stamp(s: VectorSample, tangent_rad: float) -> float:
             """Returns the per-stamp size so the caller can adjust step_px."""
             # Per-stamp curve point. Pressure clamped to a 0.1 floor so very-
@@ -1257,17 +1282,25 @@ def render_vector_line_stamp(
                 #
                 # Coordinates are relative to the stroke_alpha buffer, which
                 # is sized to the stroke bbox rather than the full canvas.
-                disc_alpha_into(
-                    stroke_alpha,
-                    s.x * ss - stroke_alpha_origin[0],
-                    s.y * ss - stroke_alpha_origin[1],
-                    rx,
-                    ry,
-                    brush.hardness,
-                    base_rot,
-                    alpha,
-                    accumulate=brush.hardness < 0.9,
-                )
+                if use_fast_disc:
+                    # Just collect — the batched kernel runs once after
+                    # the step loop. ``rx == ry`` holds (not elliptical).
+                    fast_cxs.append(s.x * ss - stroke_alpha_origin[0])
+                    fast_cys.append(s.y * ss - stroke_alpha_origin[1])
+                    fast_radii.append(rx)
+                    fast_opacities.append(alpha)
+                else:
+                    disc_alpha_into(
+                        stroke_alpha,
+                        s.x * ss - stroke_alpha_origin[0],
+                        s.y * ss - stroke_alpha_origin[1],
+                        rx,
+                        ry,
+                        brush.hardness,
+                        base_rot,
+                        alpha,
+                        accumulate=brush.hardness < 0.9,
+                    )
                 return size
             rot = base_rot
             if use_random_rot:
@@ -1316,6 +1349,20 @@ def render_vector_line_stamp(
                 step_px = max(1.0, last_size * brush.interval_base / 30.0)
                 accum = 0.0
             last_sample = s
+
+        # Fast path: flush the per-stamp arrays into the native kernel.
+        # Does the equivalent of thousands of ``disc_alpha_into`` calls in
+        # a single native-side loop — no Python call-overhead per stamp.
+        if use_fast_disc and fast_cxs:
+            _stamp_discs_fast(
+                stroke_alpha,
+                np.asarray(fast_cxs, dtype=np.float64),
+                np.asarray(fast_cys, dtype=np.float64),
+                np.asarray(fast_radii, dtype=np.float64),
+                np.asarray(fast_opacities, dtype=np.float64),
+                float(brush.hardness),
+                bool(brush.hardness < 0.9),
+            )
 
         # For disc-stamped strokes we accumulated a silhouette via MAX; now
         # alpha-composite it onto the main buffer as a single solid-color pass.
