@@ -226,6 +226,26 @@ CANVAS_IGNORED_COLUMNS = frozenset(
         "CropFrameDesignationType",
         "CropFrameShow",
         "SafeFrameShow",
+        # ICC color-management columns. CSP writes these when the canvas
+        # has an explicit color profile configured (plus "simulate color"
+        # soft-proofing variants). clip-tools does not apply ICC profiles
+        # at composite time, so just ignore them; a .clip saved with these
+        # populated would otherwise fail to open.
+        "CanvasRenderingIntent",
+        "CanvasUseLibraryType",
+        "CanvasSrcProfileName",
+        "CanvasSrcProfile",
+        "CanvasDstProfileName",
+        "CanvasDstProfile",
+        "CanvasSimulateRenderingIntent",
+        "CanvasSimulateUseLibraryType",
+        "CanvasSimulateSrcProfileName",
+        "CanvasSimulateSrcProfile",
+        "CanvasSimulateDstProfileName",
+        "CanvasSimulateDstProfile",
+        "CanvasUseColorAdjustment",
+        "CanvasColorAdjustmentToneCurve",
+        "CanvasColorAdjustmentLevel",
     }
 )
 
