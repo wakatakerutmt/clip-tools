@@ -13,7 +13,10 @@ after ``process_chunk_binary`` and before ``process_clip_data``.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -32,6 +35,56 @@ from clip_tools.types import BrushStyle, VectorPoint, VectorSample, VectorStroke
 
 
 logger = logging.getLogger(__name__)
+
+# Shared per-worker context for ProcessPoolExecutor. Populated once by
+# ``_rasterize_vectors_worker_init``, consumed by ``_rasterize_one``. Keeping
+# ``brush_styles`` / ``pattern_images`` / ``dfs`` in globals avoids pickling
+# them with every task (DataFrame pickling is the dominant per-task cost).
+_WORKER_CTX: Dict[str, Any] = {}
+
+
+def _rasterize_vectors_worker_init(
+    canvas_shape, brush_styles, pattern_images, dfs
+) -> None:
+    _WORKER_CTX["canvas_shape"] = canvas_shape
+    _WORKER_CTX["brush_styles"] = brush_styles
+    _WORKER_CTX["pattern_images"] = pattern_images
+    _WORKER_CTX["dfs"] = dfs
+
+
+def _rasterize_one(args):
+    """Rasterize a single vector blob. Called in a worker process; reads shared
+    state (canvas / brush_styles / pattern_images / dfs) from ``_WORKER_CTX``.
+    """
+    key, value = args
+    canvas_shape = _WORKER_CTX["canvas_shape"]
+    brush_styles = _WORKER_CTX["brush_styles"]
+    pattern_images = _WORKER_CTX["pattern_images"]
+    dfs = _WORKER_CTX["dfs"]
+
+    strokes = parse_vector_binary(value)
+    rendered, skipped = render_vector_line_stamp(
+        strokes, canvas_shape, brush_styles, pattern_images, dfs
+    )
+    if skipped:
+        poly = rasterize_polylines(skipped, canvas_shape, brush_styles)
+        if rendered is None:
+            rendered = poly
+        else:
+            src = poly.astype(np.float32) / 255.0
+            dst = rendered.astype(np.float32) / 255.0
+            src_a = src[..., 3:4]
+            out_a = src_a + dst[..., 3:4] * (1.0 - src_a)
+            safe = np.where(out_a > 1e-6, out_a, 1.0)
+            out_rgb = (
+                src[..., :3] * src_a + dst[..., :3] * dst[..., 3:4] * (1.0 - src_a)
+            ) / safe
+            rendered = (np.concatenate([out_rgb, out_a], axis=-1) * 255.0).astype(
+                np.uint8
+            )
+    if rendered is None:
+        rendered = np.zeros((canvas_shape[0], canvas_shape[1], 4), dtype=np.uint8)
+    return key, rendered
 
 
 # Optional Cython kernels. The compiled module is built by ``setup.py``
@@ -1461,41 +1514,87 @@ def rasterize_vectors(
     """Mutate ``clip_data`` in place: each raw-bytes vector entry becomes an
     ``np.ndarray`` render.
 
+    Vectors are independent (each raw-bytes entry maps to a single output
+    ndarray on its own key), so when there are enough of them to amortize
+    the process-pool startup cost, we fan them out across worker
+    processes. Thresholds + worker count are tuned on the Y4 fixture
+    (18 vectors, ~8 s sequential). Below the threshold we stay on the
+    original serial path to avoid pickling the ``dfs`` DataFrames when
+    we would not recover the cost.
+
     Uses the line-stamp renderer when the brush is in line-stamp mode
     (``SprayFlag == 0``). Falls back to the legacy Bresenham-line renderer for
     spray brushes or when line-stamp cannot resolve a pattern.
     """
     brush_styles = dfs.get("BrushStyle")
     pattern_images = extract_brush_pattern_images(clip_data, dfs)
-    for key, value in list(clip_data.items()):
-        if not isinstance(value, bytes):
-            continue
-        strokes = parse_vector_binary(value)
-        rendered, skipped = render_vector_line_stamp(
-            strokes, canvas_shape, brush_styles, pattern_images, dfs
-        )
-        if skipped:
-            # Spray brushes aren't line-stamped yet; rasterize them as
-            # 1-pixel polylines onto the same canvas. Better than dropping
-            # the strokes (or punting the entire blob to Bresenham, which
-            # discards the line-stamped strokes' anti-aliased thickness).
-            poly = rasterize_polylines(skipped, canvas_shape, brush_styles)
+
+    # Collect vector tasks up front so we know whether to parallelize.
+    tasks = [
+        (key, value)
+        for key, value in list(clip_data.items())
+        if isinstance(value, bytes)
+    ]
+    if not tasks:
+        return
+
+    # Serial path for small vector counts: process spawn + dfs pickling
+    # dominates the Y4 bench once vector count drops below ~4.
+    #
+    # Also force serial when we are *already* inside a spawned worker:
+    # on macOS Python 3.13+ ``multiprocessing`` defaults to the ``spawn``
+    # start method, which re-imports the caller's script. If a caller
+    # that invokes ``rasterize_vectors`` lacks an ``if __name__ ==
+    # "__main__":`` guard, each worker would recursively spawn more
+    # workers and the whole run deadlocks or thrashes. The MainProcess
+    # check keeps the parallel path reachable from top-level scripts
+    # (the standard Python multiprocessing contract) while making the
+    # recursion impossible even when a caller script is malformed.
+    is_main_process = multiprocessing.current_process().name == "MainProcess"
+    use_parallel = (
+        is_main_process
+        and len(tasks) >= 4
+        and os.environ.get("CLIP_TOOLS_NO_PARALLEL_VECTORS") != "1"
+    )
+
+    if not use_parallel:
+        for key, value in tasks:
+            strokes = parse_vector_binary(value)
+            rendered, skipped = render_vector_line_stamp(
+                strokes, canvas_shape, brush_styles, pattern_images, dfs
+            )
+            if skipped:
+                poly = rasterize_polylines(skipped, canvas_shape, brush_styles)
+                if rendered is None:
+                    rendered = poly
+                else:
+                    src = poly.astype(np.float32) / 255.0
+                    dst = rendered.astype(np.float32) / 255.0
+                    src_a = src[..., 3:4]
+                    out_a = src_a + dst[..., 3:4] * (1.0 - src_a)
+                    safe = np.where(out_a > 1e-6, out_a, 1.0)
+                    out_rgb = (
+                        src[..., :3] * src_a
+                        + dst[..., :3] * dst[..., 3:4] * (1.0 - src_a)
+                    ) / safe
+                    rendered = (
+                        np.concatenate([out_rgb, out_a], axis=-1) * 255.0
+                    ).astype(np.uint8)
             if rendered is None:
-                rendered = poly
-            else:
-                # Source-over composite of `poly` (uint8 RGBA) on top of
-                # `rendered` (uint8 RGBA). Both are in 0..255.
-                src = poly.astype(np.float32) / 255.0
-                dst = rendered.astype(np.float32) / 255.0
-                src_a = src[..., 3:4]
-                out_a = src_a + dst[..., 3:4] * (1.0 - src_a)
-                safe = np.where(out_a > 1e-6, out_a, 1.0)
-                out_rgb = (
-                    src[..., :3] * src_a + dst[..., :3] * dst[..., 3:4] * (1.0 - src_a)
-                ) / safe
-                rendered = (np.concatenate([out_rgb, out_a], axis=-1) * 255.0).astype(
-                    np.uint8
+                rendered = np.zeros(
+                    (canvas_shape[0], canvas_shape[1], 4), dtype=np.uint8
                 )
-        if rendered is None:
-            rendered = np.zeros((canvas_shape[0], canvas_shape[1], 4), dtype=np.uint8)
-        clip_data[key] = rendered
+            clip_data[key] = rendered
+        return
+
+    # Parallel path. Workers share ``brush_styles`` / ``pattern_images``
+    # / ``dfs`` via the initializer so each task payload is just the
+    # per-vector bytes blob (cheap to pickle).
+    workers = min(len(tasks), os.cpu_count() or 1)
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_rasterize_vectors_worker_init,
+        initargs=(canvas_shape, brush_styles, pattern_images, dfs),
+    ) as pool:
+        for key, rendered in pool.map(_rasterize_one, tasks):
+            clip_data[key] = rendered
