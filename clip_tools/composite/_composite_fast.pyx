@@ -196,3 +196,105 @@ def apply_source_normal(
             shape_g[py, px, 0] = sg_new
             alpha_g[py, px, 0] = ag_new
             alpha_state[py, px, 0] = a_new
+
+
+def finalize_color(
+    cnp.ndarray[f32_t, ndim=3] color_state,
+    cnp.ndarray[f32_t, ndim=3] color_0,
+    cnp.ndarray[f32_t, ndim=3] alpha_0,
+    cnp.ndarray[f32_t, ndim=3] alpha_g,
+):
+    """Compute the ``Compositor.color`` property in a single pass.
+
+    Replaces the numpy expression:
+
+        clip(color_state + (color_state - color_0)
+                           * (divide(alpha_0, alpha_g) - alpha_0))
+
+    which materializes 5 float32 arrays (two subtracts, one divide,
+    one multiply, one add) plus the clip's own output. Each call is
+    `H * W * 4` float32 bytes of churn per intermediate; for a 2 MP
+    viewport that is ~30 MB of allocation per finalize, times 53-80
+    group calls per export.
+
+    ``cu.divide``'s fallback (replace non-finite with 1.0) is honored
+    by checking ``alpha_g == 0`` and emitting 1.0 directly; everything
+    else is a plain float32 ``a / b``.
+
+    Allocates and returns a new ``(H, W, 3)`` float32 ndarray so the
+    Python signature of ``Compositor.color`` is unchanged (property
+    callers still receive a fresh buffer they can mutate).
+    """
+    cdef Py_ssize_t h = color_state.shape[0]
+    cdef Py_ssize_t w = color_state.shape[1]
+    cdef Py_ssize_t py, px
+
+    cdef cnp.ndarray[f32_t, ndim=3] out = np.empty((h, w, 3), dtype=np.float32)
+
+    cdef f32_t a0, ag, divided, delta_a
+    cdef f32_t cr, cg, cb, c0r, c0g, c0b
+    cdef f32_t delta_r, delta_g, delta_b
+    cdef f32_t vr, vg, vb
+    cdef f32_t t_mul_r, t_mul_g, t_mul_b
+    cdef f32_t one = <f32_t>1.0
+    cdef f32_t zero = <f32_t>0.0
+
+    for py in range(h):
+        for px in range(w):
+            a0 = alpha_0[py, px, 0]
+            ag = alpha_g[py, px, 0]
+
+            # Safe divide: numpy's cu.divide returns 1.0 wherever the
+            # result is non-finite (0/0, x/0). For in-range alpha
+            # values in [0, 1] the only non-finite path is ag == 0.
+            if ag == zero:
+                divided = one
+            else:
+                divided = a0 / ag
+
+            delta_a = divided - a0
+
+            cr = color_state[py, px, 0]
+            cg = color_state[py, px, 1]
+            cb = color_state[py, px, 2]
+            c0r = color_0[py, px, 0]
+            c0g = color_0[py, px, 1]
+            c0b = color_0[py, px, 2]
+
+            # Store each product/add in its own typed local so the C
+            # compiler cannot fuse into a single FMA (which would
+            # silently diverge from numpy's per-array float32 rounding
+            # by 1 ULP per op). Round 2a's PR has the full writeup on
+            # why -ffp-contract=off alone isn't sufficient without
+            # these explicit intermediates.
+            delta_r = cr - c0r
+            delta_g = cg - c0g
+            delta_b = cb - c0b
+
+            t_mul_r = delta_r * delta_a
+            t_mul_g = delta_g * delta_a
+            t_mul_b = delta_b * delta_a
+
+            vr = cr + t_mul_r
+            vg = cg + t_mul_g
+            vb = cb + t_mul_b
+
+            # Clip to [0, 1] (matches cu.clip).
+            if vr < zero:
+                vr = zero
+            elif vr > one:
+                vr = one
+            if vg < zero:
+                vg = zero
+            elif vg > one:
+                vg = one
+            if vb < zero:
+                vb = zero
+            elif vb > one:
+                vb = one
+
+            out[py, px, 0] = vr
+            out[py, px, 1] = vg
+            out[py, px, 2] = vb
+
+    return out
