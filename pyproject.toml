@@ -3,7 +3,7 @@ name = "clip-tools"
 version = "0.0.0"
 description = "Python package for working with CLIP STUDIO Paint files"
 authors = [
-    { name = "AnimeOps", email = "" }
+    { name = "AnimeOps" }
 ]
 dependencies = [
     "pandas",
@@ -36,8 +36,16 @@ classifiers = [
 ]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+# setuptools (not hatchling) so Cython extensions in clip_tools/ can be
+# cythonize()d from setup.py at build time. Cython + numpy are only needed
+# at build time; runtime depends on numpy via [project].dependencies.
+#
+# ``numpy >= 2.0`` at build time: Cython 3.x generates code that calls
+# ufunc-object accessors introduced in numpy 2.0 (e.g.
+# ``_PyUFuncObject_GET_ITEM_DATA``). An isolated build env that resolves
+# an older numpy wheel breaks compilation on those symbols.
+requires = ["setuptools>=61", "cython>=3,<3.1", "numpy>=2.0"]
+build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -78,6 +86,7 @@ disable_error_code = [
 
 [dependency-groups]
 dev = [
+    "cython>=3,<3.1",
     "mypy>=1.19.1",
     "pre-commit>=4.3.0",
     "pytest>=8.2.2",
@@ -85,8 +94,8 @@ dev = [
     "ruff>=0.15.11",
 ]
 
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.setuptools.packages.find]
+include = ["clip_tools*"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["clip_tools"]
+[tool.setuptools.package-data]
+clip_tools = ["*.pyx"]

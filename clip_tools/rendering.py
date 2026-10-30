@@ -34,6 +34,30 @@ from clip_tools.types import BrushStyle, VectorPoint, VectorSample, VectorStroke
 logger = logging.getLogger(__name__)
 
 
+# Optional Cython kernels. The compiled module is built by ``setup.py``
+# via ``cythonize``; when it's not present every call falls back to the
+# pure-numpy path so the renderer stays runnable from a plain checkout.
+#
+# * ``_stamp_discs_fast`` batches circular disc stamps (hard + soft).
+# * ``_composite_alpha_onto_fast`` runs the per-stroke Porter-Duff
+#   alpha-over of a stroke's accumulated alpha plane onto the
+#   supersampled buffer. Replaces the numpy loop in ``composite_alpha_onto``.
+# * ``_reduce_and_cast_fast`` fuses the final supersample reduce +
+#   uint8 quantization into a single pass over the painted region.
+#
+# Elliptical / textured stamps always take the per-stamp fallback.
+try:
+    from clip_tools._rendering_fast import (
+        composite_alpha_onto as _composite_alpha_onto_fast,
+        reduce_and_cast as _reduce_and_cast_fast,
+        stamp_discs_circular as _stamp_discs_fast,
+    )
+except ImportError:
+    _stamp_discs_fast = None
+    _composite_alpha_onto_fast = None
+    _reduce_and_cast_fast = None
+
+
 # -----------------------------------------------------------------------------
 # Brush pattern extraction: follows BrushPatternImage → Mipmap → Offscreen chain
 # -----------------------------------------------------------------------------
@@ -211,17 +235,15 @@ def disc_alpha_into(
     dy1 = min(alpha_buf.shape[0], y1)
     if dx1 <= dx0 or dy1 <= dy0:
         return
-    # World-coords relative to stamp center; rotate into ellipse-local frame
+    # World-coords relative to stamp center.
     yy = np.arange(dy0, dy1) + 0.5 - cy
     xx = np.arange(dx0, dx1) + 0.5 - cx
-    cos_r = float(np.cos(rotation_rad))
-    sin_r = float(np.sin(rotation_rad))
-    lx = xx[None, :] * cos_r + yy[:, None] * sin_r
-    ly = -xx[None, :] * sin_r + yy[:, None] * cos_r
     if rx == ry:
-        # Circular stamp — use simple distance-from-center in world space for
-        # a clean 1-pixel AA band.
-        dist = np.sqrt(lx * lx + ly * ly)
+        # Circular stamp — rotation preserves distance, so skip the matrix
+        # multiply. This is the common hot path (round pens): avoiding the
+        # four broadcast ops that build ``lx`` and ``ly`` saves ~10-20 µs
+        # per call before the rest of the kernel runs.
+        dist = np.sqrt(xx[None, :] ** 2 + yy[:, None] ** 2)
         if hardness >= 1.0:
             src_a = np.clip(rx + 0.5 - dist, 0.0, 1.0) * opacity
         else:
@@ -235,9 +257,14 @@ def disc_alpha_into(
                 * opacity
             ).astype(np.float32)
     else:
-        # Elliptical stamp. Use normalized ellipse distance (=1 on the
-        # boundary). AA band width = 1 normalized unit / min(rx, ry), so it
-        # corresponds to ~1 pixel along the ellipse's shorter axis.
+        # Elliptical stamp. Rotate into ellipse-local frame and use
+        # normalized ellipse distance (=1 on the boundary). AA band width =
+        # 1 normalized unit / min(rx, ry), so it corresponds to ~1 pixel
+        # along the ellipse's shorter axis.
+        cos_r = float(np.cos(rotation_rad))
+        sin_r = float(np.sin(rotation_rad))
+        lx = xx[None, :] * cos_r + yy[:, None] * sin_r
+        ly = -xx[None, :] * sin_r + yy[:, None] * cos_r
         norm_dist = np.sqrt((lx / rx) ** 2 + (ly / ry) ** 2)
         aa_half = 0.5 / min(rx, ry)
         if hardness >= 1.0:
@@ -273,6 +300,13 @@ def composite_alpha_onto(
     """Over-composite a solid-color stroke (given by its alpha mask) onto the
     RGBA buffer in one pass. Called once per stroke after all its stamps have
     been MAX-accumulated into ``stroke_alpha``."""
+    if _composite_alpha_onto_fast is not None:
+        # Single-pass native loop: ~6× faster than the numpy version on
+        # Y4 (6k calls × bbox-sized temporaries) and allocates no scratch.
+        _composite_alpha_onto_fast(
+            buffer, stroke_alpha, color[0] / 255.0, color[1] / 255.0, color[2] / 255.0
+        )
+        return
     dst_a = buffer[..., 3]
     out_a = stroke_alpha + dst_a * (1.0 - stroke_alpha)
     safe_a = np.where(out_a > 1e-6, out_a, 1.0)
@@ -1056,6 +1090,13 @@ def render_vector_line_stamp(
     buf = np.zeros((canvas_h * ss, canvas_w * ss, 4), dtype=np.float32)
     skipped: List[VectorStroke] = []
 
+    # Union bbox across every stroke that actually paints into ``buf`` (in
+    # supersampled coords). Used at the end to skip the ss-reduce + uint8
+    # cast on untouched regions of the canvas, which for a vector-heavy
+    # file with localized strokes (Y4) dominates the remaining time after
+    # the per-stroke bbox allocation win.
+    blob_bbox: Optional[List[int]] = None
+
     for st in strokes:
         color = st.color
         brush_size = st.brush_size
@@ -1140,13 +1181,85 @@ def render_vector_line_stamp(
         rng = np.random.default_rng(seed=seed)
         base_rot = np.deg2rad(brush.rotation_base)
 
-        # Per-stroke alpha accumulator (disc brushes) or full RGBA for textured
-        # brushes that still composite each stamp directly.
-        stroke_alpha = (
-            np.zeros((canvas_h * ss, canvas_w * ss), dtype=np.float32)
-            if use_analytic_disc
-            else None
+        # Compute the stroke's bounding box in supersampled coordinates. The
+        # bbox serves two purposes:
+        #   1) sizes the per-stroke alpha accumulator on the disc path so
+        #      the final composite_alpha_onto runs only over the touched
+        #      region (round-1 of #19)
+        #   2) feeds the blob-wide union bbox so the final ss-reduce and
+        #      uint8 cast skip the untouched regions of the canvas
+        #      (round-2 of #19)
+        #
+        # The upper bound on stamp radius has to cover every possible stamp
+        # the loop below might lay down:
+        #     actual = effective_size × size_mult × s.size × texture_scale × shaped_scale
+        # ``size_mult`` comes from the size-effector chain (typically peaks
+        # near 2.0 for pressure-driven brushes) and gets replaced by ``s.size``
+        # itself when a sample has the per-control lock_size bit — that
+        # replacement adds a second ``s.size`` factor. Guard both with a
+        # 4.0 cap on size_mult and ``max_s_size²`` so the bbox stays correct
+        # even for aggressive size curves without re-scanning the samples.
+        # ``+4`` absorbs AA bleed and the elliptical rotation diagonal.
+        if not samples:
+            continue
+        xs = [s.x * ss for s in samples]
+        ys = [s.y * ss for s in samples]
+        max_s_size = max((s.size for s in samples), default=1.0)
+        max_stamp_radius = (
+            effective_size
+            * 4.0
+            * max(1.0, max_s_size) ** 2
+            * max(1.0, float(brush.texture_scale))
+            * shaped_scale
+            / 2.0
+            + 4.0
         )
+        sx0 = max(0, int(np.floor(min(xs) - max_stamp_radius)))
+        sy0 = max(0, int(np.floor(min(ys) - max_stamp_radius)))
+        sx1 = min(canvas_w * ss, int(np.ceil(max(xs) + max_stamp_radius)))
+        sy1 = min(canvas_h * ss, int(np.ceil(max(ys) + max_stamp_radius)))
+        if sx1 <= sx0 or sy1 <= sy0:
+            # Stroke lives entirely off-canvas — nothing to do.
+            continue
+
+        # Grow the blob-level union bbox regardless of brush type. The
+        # textured path paints straight into ``buf`` so the stroke itself
+        # doesn't allocate anything bbox-shaped, but the final ss-reduce
+        # still needs to know the touched region.
+        if blob_bbox is None:
+            blob_bbox = [sx0, sy0, sx1, sy1]
+        else:
+            if sx0 < blob_bbox[0]:
+                blob_bbox[0] = sx0
+            if sy0 < blob_bbox[1]:
+                blob_bbox[1] = sy0
+            if sx1 > blob_bbox[2]:
+                blob_bbox[2] = sx1
+            if sy1 > blob_bbox[3]:
+                blob_bbox[3] = sy1
+
+        # Per-stroke alpha accumulator (disc brushes only; textured brushes
+        # composite each stamp directly into ``buf``).
+        if use_analytic_disc:
+            stroke_alpha = np.zeros((sy1 - sy0, sx1 - sx0), dtype=np.float32)
+            stroke_alpha_origin = (sx0, sy0)
+        else:
+            stroke_alpha = None
+            stroke_alpha_origin = (0, 0)
+
+        # Cython fast path: for circular analytic-disc strokes, collect
+        # the per-stamp (cx, cy, radius, opacity) during the step loop
+        # and hand them to the Cython batch kernel in one call after the
+        # loop. Replaces thousands of per-stamp numpy allocations with
+        # a single native-level inner loop. The elliptical path (chisel
+        # brushes) keeps the per-stamp numpy fallback.
+        use_fast_disc = (
+            use_analytic_disc and _stamp_discs_fast is not None and not elliptical
+        )
+        fast_cxs: List[float] = []
+        fast_cys: List[float] = []
+        fast_radii: List[float] = []
+        fast_opacities: List[float] = []
 
         def draw_stamp(s: VectorSample, tangent_rad: float) -> float:
             """Returns the per-stamp size so the caller can adjust step_px."""
@@ -1186,17 +1299,28 @@ def render_vector_line_stamp(
                 # accumulation so their falloff tails build up opacity along
                 # the stroke. Hard pens use MAX to avoid per-stamp AA boundaries
                 # inside the silhouette.
-                disc_alpha_into(
-                    stroke_alpha,
-                    s.x * ss,
-                    s.y * ss,
-                    rx,
-                    ry,
-                    brush.hardness,
-                    base_rot,
-                    alpha,
-                    accumulate=brush.hardness < 0.9,
-                )
+                #
+                # Coordinates are relative to the stroke_alpha buffer, which
+                # is sized to the stroke bbox rather than the full canvas.
+                if use_fast_disc:
+                    # Just collect — the batched kernel runs once after
+                    # the step loop. ``rx == ry`` holds (not elliptical).
+                    fast_cxs.append(s.x * ss - stroke_alpha_origin[0])
+                    fast_cys.append(s.y * ss - stroke_alpha_origin[1])
+                    fast_radii.append(rx)
+                    fast_opacities.append(alpha)
+                else:
+                    disc_alpha_into(
+                        stroke_alpha,
+                        s.x * ss - stroke_alpha_origin[0],
+                        s.y * ss - stroke_alpha_origin[1],
+                        rx,
+                        ry,
+                        brush.hardness,
+                        base_rot,
+                        alpha,
+                        accumulate=brush.hardness < 0.9,
+                    )
                 return size
             rot = base_rot
             if use_random_rot:
@@ -1246,18 +1370,86 @@ def render_vector_line_stamp(
                 accum = 0.0
             last_sample = s
 
+        # Fast path: flush the per-stamp arrays into the native kernel.
+        # Does the equivalent of thousands of ``disc_alpha_into`` calls in
+        # a single native-side loop — no Python call-overhead per stamp.
+        if use_fast_disc and fast_cxs:
+            _stamp_discs_fast(
+                stroke_alpha,
+                np.asarray(fast_cxs, dtype=np.float64),
+                np.asarray(fast_cys, dtype=np.float64),
+                np.asarray(fast_radii, dtype=np.float64),
+                np.asarray(fast_opacities, dtype=np.float64),
+                float(brush.hardness),
+                bool(brush.hardness < 0.9),
+            )
+
         # For disc-stamped strokes we accumulated a silhouette via MAX; now
         # alpha-composite it onto the main buffer as a single solid-color pass.
+        # Only the bbox slice of ``buf`` participates — stroke_alpha is
+        # already sized to that bbox.
         if use_analytic_disc and stroke_alpha is not None:
-            composite_alpha_onto(buf, stroke_alpha, color)
+            sx0, sy0 = stroke_alpha_origin
+            sh, sw = stroke_alpha.shape
+            buf_region = buf[sy0 : sy0 + sh, sx0 : sx0 + sw]
+            composite_alpha_onto(buf_region, stroke_alpha, color)
 
-    if ss > 1:
-        buf = buf.reshape(canvas_h, ss, canvas_w, ss, 4).mean(axis=(1, 3))
-    # CLIP converts coverage→alpha as ``min(255, floor(alpha * 256))``, which
-    # matches its internal ``coverage >> 7`` (15-bit coverage down to 8-bit).
-    # This differs by one unit from the naïve ``alpha * 255`` at most alpha
-    # values.
-    rendered = np.minimum(255, (buf * 256).astype(np.int32)).astype(np.uint8)
+    # Finalize the raster. For a vector-heavy file whose strokes only cover
+    # a small region of the canvas, the full-canvas ss-reduce and uint8
+    # cast dominate the remaining time (post round-1 of #19) because they
+    # touch every pixel regardless of whether a stroke painted there. Use
+    # ``blob_bbox`` to limit both passes to the union of all stroke bboxes;
+    # untouched regions are already zeros in ``buf`` and stay zeros in the
+    # output.
+    #
+    # CLIP's coverage→alpha conversion is ``min(255, floor(alpha * 256))``
+    # — matches its internal ``coverage >> 7`` (15-bit coverage into 8-bit).
+    # Differs by one unit from the naïve ``alpha * 255`` at most alpha values.
+    rendered = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
+    if blob_bbox is not None:
+        # Align the union bbox outward to supersample tile boundaries so
+        # the reshape math works. Division is in supersampled space.
+        bx0, by0, bx1, by1 = blob_bbox
+        ub_x0 = (bx0 // ss) * ss
+        ub_y0 = (by0 // ss) * ss
+        ub_x1 = min(canvas_w * ss, -(-bx1 // ss) * ss)
+        ub_y1 = min(canvas_h * ss, -(-by1 // ss) * ss)
+        if ub_x1 > ub_x0 and ub_y1 > ub_y0:
+            region_h = (ub_y1 - ub_y0) // ss
+            region_w = (ub_x1 - ub_x0) // ss
+            if _reduce_and_cast_fast is not None:
+                # Native single-pass: sum ss×ss subpixels, divide by ss²,
+                # multiply by 256, clamp to 255, cast to uint8, write.
+                # Avoids the ``reduced`` float32 temp and the subsequent
+                # int32 cast temp (both proportional to painted-region
+                # bytes). ~2× faster than the einsum+cast pair on Y4.
+                _reduce_and_cast_fast(
+                    buf,
+                    rendered,
+                    ub_y0,
+                    ub_x0,
+                    region_h,
+                    region_w,
+                    ss,
+                    1.0 / (ss * ss),
+                )
+            else:
+                if ss > 1:
+                    # ``einsum`` with an explicit sum-and-divide beats
+                    # ``.mean(axis=(1,3))`` by ~25% on a Y4-sized buffer
+                    # (578 ms vs 775 ms for 1227 MB float32), and is bit-exact
+                    # against the one-shot ``.sum(axis=(1,3)) / ss²`` baseline.
+                    tiled = buf[ub_y0:ub_y1, ub_x0:ub_x1].reshape(
+                        region_h, ss, region_w, ss, 4
+                    )
+                    reduced = np.einsum("hswSc->hwc", tiled) * (1.0 / (ss * ss))
+                else:
+                    reduced = buf[ub_y0:ub_y1, ub_x0:ub_x1]
+                # Final uint8 cast on just the painted region.
+                rendered[
+                    ub_y0 // ss : ub_y0 // ss + region_h,
+                    ub_x0 // ss : ub_x0 // ss + region_w,
+                ] = np.minimum(255, (reduced * 256).astype(np.int32)).astype(np.uint8)
     return rendered, skipped
 
 
