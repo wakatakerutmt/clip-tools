@@ -20,13 +20,15 @@ from clip_tools.constants import LayerComposite, LayerFolderBit
 try:
     from clip_tools.composite._composite_fast import (
         apply_source_normal as _apply_source_normal_fast,
+        finalize_color as _finalize_color_fast,
     )
 except ImportError:  # pragma: no cover
     # The Cython extension is optional at import time — ``_apply_source``
-    # falls back to the pure-numpy path when the compiled module is
-    # unavailable (fresh checkout without a build, PyPy, non-x86 arch
-    # without wheels, etc.).
+    # and the ``color`` property fall back to the pure-numpy expressions
+    # when the compiled module is unavailable (fresh checkout without a
+    # build, PyPy, non-x86 arch without wheels, etc.).
     _apply_source_normal_fast = None
+    _finalize_color_fast = None
 
 if TYPE_CHECKING:
     from clip_tools.api.clip_layer import ClipLayer
@@ -313,6 +315,19 @@ class Compositor:
     @property
     def color(self) -> np.ndarray:
         # Adobe "group color correction": undo backdrop contribution.
+        # Fast path: the Cython kernel fuses the 5 numpy intermediates
+        # (two subtracts, one divide, one multiply, one add + clip) into
+        # a single pass, cutting per-call allocation churn. Falls back
+        # to the pure-numpy expression when the compiled module is
+        # unavailable, keeping ``_finalize_color_fast`` monkey-patchable
+        # for the bit-exact regression test.
+        if _finalize_color_fast is not None:
+            return _finalize_color_fast(
+                self._color,
+                self._color_0,
+                self._alpha_0,
+                self._alpha_g,
+            )
         return cu.clip(
             self._color
             + (self._color - self._color_0)

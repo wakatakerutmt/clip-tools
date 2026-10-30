@@ -225,6 +225,28 @@ class TestTest000:
             "is being auto-emitted."
         )
 
+    def test_finalize_color_cython_matches_numpy_fallback(
+        self, test000_clip: ClipImage
+    ):
+        # Issue #28 Round 2b: ``Compositor.color`` has a Cython fast path
+        # (``finalize_color``) that fuses the 5 numpy intermediates into
+        # a single kernel pass. Same bit-exact contract as the
+        # _apply_source path — monkey-patch the symbol to None, compare.
+        from clip_tools.composite import compositor as cm
+
+        fast = cm._finalize_color_fast
+        try:
+            cython_output = np.array(test000_clip.composite())
+            cm._finalize_color_fast = None
+            numpy_output = np.array(test000_clip.composite(force=True))
+        finally:
+            cm._finalize_color_fast = fast
+        assert np.array_equal(cython_output, numpy_output), (
+            "finalize_color Cython path diverges from the numpy expression. "
+            "Check -ffp-contract=off and that every multiply/add in the "
+            "kernel writes to its own typed local."
+        )
+
     def test_visible_setter_keeps_dataframe_in_sync(self, test000_clip: ClipImage):
         # Issue #28 B-1: writes must update both the snapshot and the
         # DataFrame so round-trip save paths (and anything reading the
