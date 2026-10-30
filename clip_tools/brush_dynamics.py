@@ -20,7 +20,9 @@ The renderer assembles ``CurvePoint`` instances per polyline sample
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 from clip_tools.structs.blob_parsers import BrushEffector
 
@@ -49,7 +51,15 @@ class CurvePoint:
 # ---------------------------------------------------------------------------
 
 
-def eval_curve_graph(points: List[Tuple[float, float]], x: float) -> float:
+try:
+    from clip_tools._rendering_fast import (
+        eval_curve_graph_sorted as _eval_curve_sorted_fast,
+    )
+except ImportError:  # pragma: no cover
+    _eval_curve_sorted_fast = None
+
+
+def eval_curve_graph(points, x: float) -> float:
     """Evaluate a control polyline as the visual "brush settings → curve" UI.
 
     For n control points sorted by x:
@@ -66,7 +76,15 @@ def eval_curve_graph(points: List[Tuple[float, float]], x: float) -> float:
     Output is the y of the curve at input x. ``x`` outside
     ``[p[0].x, p[-1].x]`` is clamped to the nearest endpoint y, matching
     the brush settings UI.
+
+    Fast path: when ``points`` is a presorted ``(n, 2)`` float64
+    numpy array (as returned by :func:`build_effector_curves`), the
+    Cython kernel runs directly, skipping the per-call ``sorted(...)``
+    + per-point tuple unpacking the Python fallback has to do.
     """
+    if _eval_curve_sorted_fast is not None and isinstance(points, np.ndarray):
+        return _eval_curve_sorted_fast(points, x)
+
     n = len(points)
     if n < 2:
         return 0.0
@@ -185,11 +203,14 @@ class MsvcRandom:
 # ---------------------------------------------------------------------------
 
 
+_IDENTITY_CURVE = np.asarray([(0.0, 0.0), (1.0, 1.0)], dtype=np.float64)
+
+
 def apply_effector(
     eff: Optional[BrushEffector],
     base: float,
     cp: CurvePoint,
-    curves: Optional[Dict[int, List[Tuple[float, float]]]] = None,
+    curves: Optional[Dict[int, Any]] = None,
     rng: Optional[MsvcRandom] = None,
     use_random: bool = False,
 ) -> float:
@@ -213,13 +234,13 @@ def apply_effector(
 
     if eff.pressure is not None:
         cid = eff.pressure.curve_id
-        pts = (curves or {}).get(cid, [(0.0, 0.0), (1.0, 1.0)])
+        pts = (curves or {}).get(cid, _IDENTITY_CURVE)
         cy = eval_curve_graph(pts, cp.pressure)
         out *= cy * (1.0 - eff.pressure.min) + eff.pressure.min
 
     if eff.velocity is not None:
         cid = eff.velocity.curve_id
-        pts = (curves or {}).get(cid, [(0.0, 0.0), (1.0, 1.0)])
+        pts = (curves or {}).get(cid, _IDENTITY_CURVE)
         cy = eval_curve_graph(pts, cp.velocity)
         out *= cy * (eff.velocity.max - eff.velocity.min) + eff.velocity.min
 
@@ -238,8 +259,19 @@ def apply_effector(
 
 def build_effector_curves(
     effector_graph_records,
-) -> Dict[int, List[Tuple[float, float]]]:
+) -> Dict[int, Any]:
     """Materialize a `{MainId: control_points}` map from a list of
     `BrushEffectorGraphDataRecord`. Pass directly to `apply_effector`.
+
+    Each value is a pre-sorted ``(n, 2)`` float64 numpy array (sorted by
+    x). Hoisting the sort to parse time (once per brush) saves a
+    ``sorted(...)`` call per :func:`eval_curve_graph` invocation — those
+    show up in the hundreds of thousands per export in profile data
+    (911k calls on Y4). The Cython fast path consumes the array
+    directly without any Python-level unpacking.
     """
-    return {r.main_id: list(r.control_points) for r in effector_graph_records}
+    out: Dict[int, Any] = {}
+    for r in effector_graph_records:
+        pts = sorted(r.control_points, key=lambda p: p[0])
+        out[r.main_id] = np.asarray(pts, dtype=np.float64)
+    return out

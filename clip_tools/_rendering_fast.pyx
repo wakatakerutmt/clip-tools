@@ -21,12 +21,128 @@ Semantics match the numpy references within float32 LSB (< 1 unit at
 uint8 output on the files the project tracks).
 """
 
-from libc.math cimport sqrt, floor, ceil
+from libc.math cimport sqrt, floor, ceil, fabs
 import numpy as np
 cimport numpy as cnp
 
 ctypedef cnp.float32_t f32_t
 ctypedef cnp.uint8_t u8_t
+ctypedef cnp.float64_t f64_t
+
+
+def eval_curve_graph_sorted(
+    cnp.ndarray[f64_t, ndim=2] pts,
+    double x,
+):
+    """Evaluate a brush-dynamics curve at ``x``.
+
+    ``pts`` is an ``(n, 2)`` float64 array of control points **already
+    sorted by x** (caller invariant). Transcribes the pure-Python
+    reference in ``clip_tools.brush_dynamics.eval_curve_graph``
+    one-for-one, including the clamping, linear-only endpoint segments,
+    and 8-iteration Newton solve inside the cubic Bezier for interior
+    segments. Semantics are bit-exact against the reference when the
+    caller feeds pre-sorted input (the reference's own ``sorted(...)``
+    call is a stable sort on x, so ``build_effector_curves`` can hoist
+    the sort to parse time without changing values).
+
+    Returns 0.0 when ``n < 2``, mirroring the reference's early return.
+    """
+    cdef Py_ssize_t n = pts.shape[0]
+    cdef Py_ssize_t i
+    cdef double x0, y0, x1, y1
+    cdef double p0x, p0y, p1x, p1y, h1x, h1y, h2x, h2y
+    cdef double t, u, bx, dbx
+    cdef double px_prev_x, px_prev_y, px_next_x, px_next_y
+    cdef double seg_start_x, seg_start_y, seg_end_x, seg_end_y
+    cdef int it
+
+    if n < 2:
+        return 0.0
+
+    # Clamp to endpoints (matches reference's early returns).
+    if x <= pts[0, 0]:
+        return pts[0, 1]
+    if x >= pts[n - 1, 0]:
+        return pts[n - 1, 1]
+
+    # n == 2: linear.
+    if n == 2:
+        x0 = pts[0, 0]
+        y0 = pts[0, 1]
+        x1 = pts[1, 0]
+        y1 = pts[1, 1]
+        if x1 == x0:
+            return y0
+        return y0 + (x - x0) * (y1 - y0) / (x1 - x0)
+
+    # Find segment i such that pts[i].x <= x < pts[i+1].x.
+    i = 0
+    while i + 1 < n and x >= pts[i + 1, 0]:
+        i += 1
+    seg_start_x = pts[i, 0]
+    seg_start_y = pts[i, 1]
+    seg_end_x = pts[i + 1, 0]
+    seg_end_y = pts[i + 1, 1]
+
+    # Endpoint segments are always linear.
+    if i == 0 or i == n - 2:
+        if seg_end_x == seg_start_x:
+            return seg_start_y
+        return (
+            seg_start_y
+            + (x - seg_start_x) * (seg_end_y - seg_start_y)
+            / (seg_end_x - seg_start_x)
+        )
+
+    # Interior segment: cubic Bezier with neighbor-midpoint handles.
+    px_prev_x = pts[i - 1, 0]
+    px_prev_y = pts[i - 1, 1]
+    px_next_x = pts[i + 2, 0]
+    px_next_y = pts[i + 2, 1]
+
+    p0x = seg_start_x
+    p0y = seg_start_y
+    p1x = seg_end_x
+    p1y = seg_end_y
+    h1x = (seg_start_x + seg_end_x) * 0.5
+    h1y = (seg_start_y + seg_end_y) * 0.5
+    h2x = (seg_end_x + px_next_x) * 0.5
+    h2y = (seg_end_y + px_next_y) * 0.5
+
+    if p1x == p0x:
+        return p0y
+    # Newton init: linear interp t.
+    t = (x - p0x) / (p1x - p0x)
+    for it in range(8):
+        u = 1.0 - t
+        bx = (
+            u * u * u * p0x
+            + 3.0 * u * u * t * h1x
+            + 3.0 * u * t * t * h2x
+            + t * t * t * p1x
+        )
+        dbx = (
+            3.0 * u * u * (h1x - p0x)
+            + 6.0 * u * t * (h2x - h1x)
+            + 3.0 * t * t * (p1x - h2x)
+        )
+        if fabs(dbx) < 1e-9:
+            break
+        t -= (bx - x) / dbx
+        if t < 0.0:
+            t = 0.0
+            break
+        if t > 1.0:
+            t = 1.0
+            break
+    u = 1.0 - t
+    return (
+        u * u * u * p0y
+        + 3.0 * u * u * t * h1y
+        + 3.0 * u * t * t * h2y
+        + t * t * t * p1y
+    )
 
 
 def stamp_discs_circular(
