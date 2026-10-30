@@ -174,6 +174,51 @@ class TestTest000:
         found = test000_clip.find("用紙")
         assert found is test000_clip._children[0]
 
+    def test_parent_returns_root_identity(self, test000_clip: ClipImage):
+        # Issue #28 B-1: `layer.parent` returns the single shared instance
+        # from the tree's instance map, not a freshly constructed ClipLayer.
+        # Every child's parent must therefore be `test000_clip` by identity.
+        for layer in test000_clip:
+            assert layer.parent is test000_clip
+
+    def test_parent_is_stable_across_calls(self, test000_clip: ClipImage):
+        # Issue #28 B-1 identity contract: calling `.parent` twice returns
+        # the same Python object. Previously each access built a new
+        # ClipLayer and this comparison was False.
+        for layer in test000_clip:
+            assert layer.parent is layer.parent
+
+    def test_root_parent_is_none(self, test000_clip: ClipImage):
+        # Issue #28 B-1: the root has no parent in the instance map and
+        # safely returns None. The previous `self._layer_map[parent_id]`
+        # raised when parent_id (0 for the root) had no entry.
+        assert test000_clip.parent is None
+
+    def test_find_returns_tree_instance(self, test000_clip: ClipImage):
+        # Issue #28 B-1: `find` walks the tree so the returned layer must
+        # be the instance registered under its layer_id, i.e. identical
+        # to the one found by iteration.
+        found = test000_clip.find("layer1")
+        assert found is not None
+        by_iter = [layer for layer in test000_clip if layer.name == "layer1"][0]
+        assert found is by_iter
+
+    def test_visible_setter_keeps_dataframe_in_sync(self, test000_clip: ClipImage):
+        # Issue #28 B-1: writes must update both the snapshot and the
+        # DataFrame so round-trip save paths (and anything reading the
+        # DataFrame directly) stay consistent.
+        layer = test000_clip._children[1]  # "layer1"
+        original = layer.visible
+        try:
+            layer.visible = not original
+            # Snapshot reflects the new value.
+            assert layer.visible is (not original)
+            # DataFrame reflects the new value.
+            df_value = int(layer._record.loc[layer._idx, "LayerVisibility"])
+            assert bool(df_value) is (not original)
+        finally:
+            layer.visible = original
+
     def test_bboxes(self, test000_clip: ClipImage):
         assert [tuple(int(x) for x in l.bbox) for l in test000_clip] == [
             (0, 0, 0, 0),

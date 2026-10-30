@@ -34,6 +34,7 @@ class ClipLayer:
         raster: Dict[int, LayerEntry],
         canvas_size: Tuple[int, int],
         layer_map: Optional[Dict[int, int]] = None,
+        instance_map: Optional[Dict[int, "ClipLayer"]] = None,
     ):
         """
         Args:
@@ -42,6 +43,12 @@ class ClipLayer:
             raster (dict): Map from layer_id to the raster image.
             canvas_size (Tuple[int, int]): Size of the canvas.
             layer_map (Optional[Dict[int, int]]): Map from layer_id to index in the layer dataframe.
+            instance_map (Optional[Dict[int, ClipLayer]]): Shared map from
+                layer_id to the single ``ClipLayer`` instance for that layer.
+                Populated during the recursive tree build; ``parent`` / tree
+                walks look up here so every reference to the same layer is
+                the same Python object (identity semantics match psd-tools).
+                Passing ``None`` at the root starts a fresh map.
         """
         self._record = record
         self._idx = idx
@@ -52,12 +59,36 @@ class ClipLayer:
         self._resizable_image_attrs = None
         self._composited = None
 
+        # Snapshot the layer's row into a typed LayerRecord once, at
+        # construction time. Reads (``.name``, ``.visible``, ``.opacity``,
+        # ``.blend_mode``, ``.bbox``) go through this snapshot instead of
+        # doing a fresh ``_record.loc[idx]`` + ``LayerRecord.from_row()``
+        # per access. The compositor hot path reads several attributes per
+        # layer per pass, so eliminating that per-attribute DataFrame
+        # dispatch is the main speedup for Issue #28. Setters update
+        # ``_meta`` and ``_record`` together (see ``visible.setter``,
+        # ``opacity.setter``) so the DataFrame remains a source of truth
+        # for anything that needs to round-trip the file back to .clip.
+        self._meta = LayerRecord.from_row(record.loc[idx])
+
         if layer_map is None:
             self._layer_map = {}
             for index, row in self._record.iterrows():
                 self._layer_map[row["MainId"]] = index
         else:
             self._layer_map = layer_map
+
+        # Register this instance in the shared instance map before
+        # recursing to children, so a child's ``parent`` lookup can find
+        # us. The map is shared across the whole tree, so one layer is
+        # represented by exactly one ``ClipLayer`` object: this is the
+        # identity contract that lets ``layer.parent is layer.parent``
+        # return True and matches psd-tools' tree semantics.
+        if instance_map is None:
+            self._instance_map = {}
+        else:
+            self._instance_map = instance_map
+        self._instance_map[self.layer_id] = self
 
         self._children = []
         for child_id in self.children_ids:
@@ -68,6 +99,7 @@ class ClipLayer:
                     self._raster,
                     self._canvas_size,
                     self._layer_map,
+                    self._instance_map,
                 )
             )
 
@@ -75,15 +107,18 @@ class ClipLayer:
     def metadata(self) -> LayerRecord:
         """Typed view of this layer's row in the dataframe.
 
-        Built fresh on each access — the dataframe stays the source of truth
-        for writes (visibility/opacity setters), so the snapshot doesn't go
-        stale.
+        Returns the snapshot built at construction time
+        (``__init__`` set ``self._meta`` once). Reads are a plain attribute
+        access with no DataFrame lookup. Writes (``visible.setter``,
+        ``opacity.setter``) mutate this snapshot and the DataFrame together,
+        so the DataFrame remains in sync for round-trip serialization
+        while reads stay fast.
         """
-        return LayerRecord.from_row(self._record.loc[self._idx])
+        return self._meta
 
     @property
     def layer_id(self) -> int:
-        return int(self._record["MainId"].loc[self._idx])
+        return int(self._meta.main_id)
 
     @property
     def name(self) -> str:
@@ -111,14 +146,23 @@ class ClipLayer:
         return [child.name for child in self._children]
 
     @property
-    def parent(self) -> ClipLayer:
-        return ClipLayer(
-            self._record,
-            self._layer_map[self.parent_id],
-            self._raster,
-            self._canvas_size,
-            self._layer_map,
-        )
+    def parent(self) -> Optional[ClipLayer]:
+        """Return the parent ``ClipLayer``, or ``None`` if this is the root.
+
+        Looks up the shared instance map built during the recursive tree
+        construction, so every call returns the *same* object:
+        ``layer.parent is layer.parent`` → ``True``. This matches
+        psd-tools' tree semantics, where every layer in the tree has
+        exactly one Python object representing it, and lets callers rely
+        on identity comparisons (``layer.parent is other_layer``).
+
+        The root layer (``ClipImage``) has no parent and returns ``None``;
+        the previous behaviour of raising on a missing parent came from
+        creating a new ``ClipLayer`` for every call, which also raised
+        when ``parent_id`` had no mapping. Returning ``None`` for the
+        root makes the ascending walk safe.
+        """
+        return self._instance_map.get(self.parent_id)
 
     @property
     def children(self) -> List[ClipLayer]:
@@ -130,7 +174,12 @@ class ClipLayer:
 
     @visible.setter
     def visible(self, value: bool) -> None:
-        self._record.loc[self._idx, "LayerVisibility"] = 1 if value else 0
+        # Update both the snapshot and the DataFrame together: reads come
+        # from the snapshot, but the DataFrame is still the source of
+        # truth for anything that round-trips back to the .clip file.
+        v = 1 if value else 0
+        self._meta.layer_visibility = v
+        self._record.loc[self._idx, "LayerVisibility"] = v
 
     @property
     def opacity(self) -> float:
@@ -138,8 +187,10 @@ class ClipLayer:
 
     @opacity.setter
     def opacity(self, value: float) -> None:
-        ## TODO: WILL LIKELY FAIL
-        self._record.loc[self._idx, "LayerOpacity"] = int(value * 256)
+        # Same two-write pattern as ``visible`` — see the comment there.
+        v = int(value * 256)
+        self._meta.layer_opacity = v
+        self._record.loc[self._idx, "LayerOpacity"] = v
 
     @property
     def blend_mode(self) -> LayerComposite:
