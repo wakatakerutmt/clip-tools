@@ -203,6 +203,28 @@ class TestTest000:
         by_iter = [layer for layer in test000_clip if layer.name == "layer1"][0]
         assert found is by_iter
 
+    def test_composite_cython_matches_numpy_fallback(self, test000_clip: ClipImage):
+        # Issue #28 Round 2a: the Cython fast path for _apply_source NORMAL
+        # non-knockout must produce byte-identical output to the numpy
+        # fallback. Monkey-patch the Cython symbol to None so the fallback
+        # runs, compare against the normal (Cython-enabled) output.
+        from clip_tools.composite import compositor as cm
+
+        fast = cm._apply_source_normal_fast
+        try:
+            cython_output = np.array(test000_clip.composite())
+            cm._apply_source_normal_fast = None
+            # Force a fresh composite (bypass per-layer _composited cache).
+            numpy_output = np.array(test000_clip.composite(force=True))
+        finally:
+            cm._apply_source_normal_fast = fast
+        assert np.array_equal(cython_output, numpy_output), (
+            "Cython fast path diverges from numpy fallback — the kernel's "
+            "operation order must match numpy's per-array materialization "
+            "bit-for-bit. Check -ffp-contract=off is honored and no FMA "
+            "is being auto-emitted."
+        )
+
     def test_visible_setter_keeps_dataframe_in_sync(self, test000_clip: ClipImage):
         # Issue #28 B-1: writes must update both the snapshot and the
         # DataFrame so round-trip save paths (and anything reading the
