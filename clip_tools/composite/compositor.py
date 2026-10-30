@@ -17,6 +17,17 @@ from clip_tools.composite import utils as cu
 from clip_tools.composite.blend import BLEND_FUNC, normal
 from clip_tools.constants import LayerComposite, LayerFolderBit
 
+try:
+    from clip_tools.composite._composite_fast import (
+        apply_source_normal as _apply_source_normal_fast,
+    )
+except ImportError:  # pragma: no cover
+    # The Cython extension is optional at import time — ``_apply_source``
+    # falls back to the pure-numpy path when the compiled module is
+    # unavailable (fresh checkout without a build, PyPy, non-x86 arch
+    # without wheels, etc.).
+    _apply_source_normal_fast = None
+
 if TYPE_CHECKING:
     from clip_tools.api.clip_layer import ClipLayer
 
@@ -247,6 +258,29 @@ class Compositor:
         blend_mode: LayerComposite,
         knockout: bool,
     ) -> None:
+        # Fast path: NORMAL + non-knockout handled by a single Cython kernel
+        # that fuses shape/alpha/color accumulation into one pass over the
+        # viewport, avoiding ~15 numpy temporary arrays per call. Falls
+        # through to the full numpy expression below when the compiled
+        # module isn't available, when a non-NORMAL blend mode is in
+        # play, or when the group is in knockout.
+        if (
+            _apply_source_normal_fast is not None
+            and blend_mode == LayerComposite.NORMAL
+            and not knockout
+        ):
+            _apply_source_normal_fast(
+                self._color,
+                self._shape_g,
+                self._alpha_g,
+                self._alpha,
+                self._alpha_0,
+                color,
+                shape,
+                alpha,
+            )
+            return
+
         self._shape_g = cu.union(self._shape_g, shape)
         if knockout:
             self._alpha_g = (
