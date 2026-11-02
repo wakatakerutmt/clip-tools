@@ -113,7 +113,13 @@ def process_clip_data(
     auxillary_list: List[LayerEntry] = []
     processed: set = set()
 
-    for key, value in clip_data.items():
+    # Iterate by popping so each layer's decompressed block bytes are freed
+    # as soon as its raster buffer has been built. Without this, every
+    # layer's chunks stay live in ``clip_data`` through the whole loop,
+    # peaking in the GB range for medium/large fixtures. See the
+    # downstream Phase 1 memray findings for the full picture.
+    for key in list(clip_data.keys()):
+        value = clip_data.pop(key)
         table_name = external_id_map[key].table_name
         column_name = external_id_map[key].column_name
 
@@ -124,12 +130,17 @@ def process_clip_data(
                 dfs["Offscreen"]["BlockData"] == key.encode("ascii")
             ].iloc[0]
             blocks = sorted(value.items(), key=lambda x: x[0])
+            # Drop the only remaining reference to the per-layer bytes dict so
+            # it can be freed; ``blocks`` already holds the bytes it needs.
+            del value
             try:
                 processed_layer_arr = process_layer_blocks(blocks, offscreen)
             except Exception:
                 logger.error(
                     f"Error processing layer: {key} in {table_name} {column_name}"
                 )
+            # Raw block tuples no longer needed once the raster is built.
+            del blocks
 
             if DEBUG:
                 save_debug_layer_image(processed_layer_arr, name, key, "raster")
@@ -201,7 +212,7 @@ def process_clip_data(
                 f"Processing layer: {layer_name} in folder: {layer_prefix} with ID: {layer_id}"
             )
             raster_dict[layer_id] = LayerEntry(type="raster", image=processed_layer_arr)
-            del blocks
+            # (``blocks`` already deleted above right after process_layer_blocks)
 
         elif isinstance(value, np.ndarray):
             if DEBUG:
