@@ -65,22 +65,23 @@ def composite(
         h, w = group._canvas_size  # (H, W)
         viewport = (0, 0, int(w), int(h))
 
-    vw = viewport[2] - viewport[0]
-    vh = viewport[3] - viewport[1]
-    if color is None:
-        color = np.zeros((vh, vw, 3), dtype=np.float32)
-    if alpha is None:
-        alpha = np.zeros((vh, vw, 1), dtype=np.float32)
-
-    # A top-level composite always isolates (there is no outer backdrop to
-    # pass through); nested calls set this explicitly based on blend mode.
+    # Decide isolation first (ADR 0018). When the resulting Compositor is
+    # isolated it allocates its own zero backdrop internally, so we don't
+    # need to materialize a zero ``color``/``alpha`` here just to have the
+    # Compositor ignore it. For the pass-through case we still need the
+    # real backdrop, so a caller-supplied None is filled in with zeros.
     isolated = True
     if _is_group(group):
         bm = _blend_mode(group)
-        if bm != LayerComposite.PASS_THROUGH:
-            isolated = True
-        else:
-            isolated = False
+        isolated = bm != LayerComposite.PASS_THROUGH
+
+    if not isolated:
+        vw = viewport[2] - viewport[0]
+        vh = viewport[3] - viewport[1]
+        if color is None:
+            color = np.zeros((vh, vw, 3), dtype=np.float32)
+        if alpha is None:
+            alpha = np.zeros((vh, vw, 1), dtype=np.float32)
 
     compositor = Compositor(
         viewport=viewport,
@@ -127,8 +128,8 @@ class Compositor:
     def __init__(
         self,
         viewport: Viewport,
-        color: np.ndarray,
-        alpha: np.ndarray,
+        color: Optional[np.ndarray],
+        alpha: Optional[np.ndarray],
         isolated: bool,
         layer_filter: Optional[LayerFilter] = None,
         force: bool = False,
@@ -140,16 +141,30 @@ class Compositor:
         vw = viewport[2] - viewport[0]
         vh = viewport[3] - viewport[1]
 
-        self._color_0 = np.zeros_like(color) if isolated else color
-        self._alpha_0 = np.zeros_like(alpha) if isolated else alpha
-
         # Group's accumulated geometric and effective coverage.
         self._shape_g = np.zeros((vh, vw, 1), dtype=np.float32)
         self._alpha_g = np.zeros((vh, vw, 1), dtype=np.float32)
 
-        # Running composite starts at backdrop.
-        self._color = self._color_0.copy()
-        self._alpha = self._alpha_0.copy()
+        if isolated:
+            # Fresh zero backdrop; the caller may pass None in this case
+            # (ADR 0018). Allocating directly skips the old pattern of
+            # ``_color_0 = np.zeros_like(color)`` + ``_color = _color_0.copy()``
+            # which produced two zero buffers out of one incoming backdrop
+            # that was itself a wasted copy.
+            self._color_0 = np.zeros((vh, vw, 3), dtype=np.float32)
+            self._alpha_0 = np.zeros((vh, vw, 1), dtype=np.float32)
+            self._color = np.zeros((vh, vw, 3), dtype=np.float32)
+            self._alpha = np.zeros((vh, vw, 1), dtype=np.float32)
+        else:
+            # Pass-through: ``_color_0`` and ``_alpha_0`` are read-only
+            # backdrop references (checked across finish() and the
+            # knockout path). ``_color`` and ``_alpha`` are the running
+            # composite buffers and must be writable, so copy once here.
+            assert color is not None and alpha is not None
+            self._color_0 = color
+            self._alpha_0 = alpha
+            self._color = color.copy()
+            self._alpha = alpha.copy()
 
     # ---- Public: apply one child ---------------------------------------
     def apply(self, layer) -> None:
@@ -205,7 +220,29 @@ class Compositor:
     def _get_group(
         self, group, knockout: bool
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Recursively composite a child group within this parent's viewport."""
+        """Recursively composite a child group within this parent's viewport.
+
+        ADR 0018 (Phase 3) memory optimization: previously this ``.copy()`` 'd
+        the parent's backdrop buffers before passing them in. Those copies
+        were wasteful because:
+
+        - Isolated child (``bm != PASS_THROUGH``): the child Compositor
+          replaces the passed-in buffers with ``np.zeros_like`` anyway
+          (``_color_0`` is set to a fresh zero buffer). Passing ``None``
+          lets ``composite()`` allocate a single zero buffer per axis,
+          skipping both the caller's ``.copy()`` and the inner
+          ``zeros_like``.
+        - Pass-through child: the child's Compositor still ``.copy()`` s
+          the incoming buffer into its own working ``_color`` / ``_alpha``,
+          and only ever READS ``_color_0`` / ``_alpha_0`` from then on
+          (``finish()`` + knockout path, never mutates). The outer
+          ``.copy()`` duplicated that work.
+
+        For an 8K canvas each saved ``.copy()`` is ~hundreds of MiB; on
+        fixtures with 3+ nesting levels this cuts GB-level transient
+        allocations. Composite semantics are unchanged — the bit-exact
+        regression stays green.
+        """
         if knockout:
             backdrop_color = self._color_0
             backdrop_alpha = self._alpha_0
@@ -213,10 +250,16 @@ class Compositor:
             backdrop_color = self._color
             backdrop_alpha = self._alpha
 
+        # Decide isolation up front so we can skip the backdrop entirely in
+        # the isolated case. Matches the logic inside composite() around
+        # the ``isolated =`` assignment — no behavioural drift.
+        child_bm = _blend_mode(group) if _is_group(group) else LayerComposite.NORMAL
+        child_isolated = child_bm != LayerComposite.PASS_THROUGH
+
         return composite(
             group,
-            color=backdrop_color.copy(),
-            alpha=backdrop_alpha.copy(),
+            color=None if child_isolated else backdrop_color,
+            alpha=None if child_isolated else backdrop_alpha,
             viewport=self._viewport,
             layer_filter=self._layer_filter,
             force=self._force,
