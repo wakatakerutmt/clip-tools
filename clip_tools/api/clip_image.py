@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Iterable, Optional
 
 from clip_tools.api.clip_layer import ClipLayer
 from clip_tools.constants import DEBUG
@@ -19,7 +20,28 @@ logger = logging.getLogger(__name__)
 
 class ClipImage(ClipLayer):
     @classmethod
-    def open(cls, path: str) -> ClipLayer:
+    def open(
+        cls,
+        path: str,
+        touched_layer_ids: Optional[Iterable[int]] = None,
+    ) -> ClipLayer:
+        """Open a .clip file and return the root :class:`ClipImage`.
+
+        :param touched_layer_ids: Optional set of layer MainIds that will
+            actually participate in composite. When given, layers whose id
+            is not in the set skip the per-layer raster buffer allocation
+            inside :func:`process_clip_data`: ``_leaf_raster`` returns
+            ``None`` for them during composite, which renders transparent
+            (the compositor's existing safe fallback).
+
+            ``None`` (the default) preserves pre-ADR-0016 behaviour: every
+            layer gets its raster built, byte-identical to prior output.
+
+            Consumers that want this saving typically do a cheap first
+            :meth:`open_metadata` pass to walk the layer tree and compute
+            the touched set, then call ``open(path, touched_layer_ids=...)``
+            for the real load.
+        """
         base_name = os.path.splitext(os.path.basename(path))[0]
 
         with open(path, "rb") as f:
@@ -55,7 +77,52 @@ class ClipImage(ClipLayer):
 
         record = augment_layer_df(dfs["Layer"])
         raster, _auxillary_list = process_clip_data(
-            base_name, clip_data, dfs, record, external_id_map
+            base_name,
+            clip_data,
+            dfs,
+            record,
+            external_id_map,
+            touched_layer_ids=touched_layer_ids,
         )
 
         return cls(record, 0, raster, canvas_size)
+
+    @classmethod
+    def open_metadata(cls, path: str) -> ClipLayer:
+        """Open a .clip file and return the layer tree WITHOUT loading rasters.
+
+        Fast first-pass for discovering layer structure (``find`` /
+        ``descendants`` / ``find_deepest_same_named`` / etc.) when the
+        caller plans to compute a touched layer id set and re-open with
+        :meth:`open(path, touched_layer_ids=...)`.
+
+        Internally this skips :func:`process_chunk_binary`,
+        :func:`rasterize_vectors` and :func:`process_clip_data`: only the
+        SQLite side (``dfs`` + ``augment_layer_df``) is parsed. ``_raster``
+        is an empty dict, so ``composite()`` on the returned tree would
+        yield fully-transparent output — the metadata-only tree is for
+        traversal, not rendering.
+
+        See ADR 0016 for the 2-pass open contract.
+        """
+        base_name = os.path.splitext(os.path.basename(path))[0]
+
+        with open(path, "rb") as f:
+            clip_str = f.read()
+
+        _clip_binary, sqlite_binary = split_clip_binary(clip_str)
+        # Drop the raw bytes right after splitting — the metadata-only path
+        # never touches the clip_binary half, so there's no reason to keep
+        # it alive for the lifetime of this method.
+        del clip_str
+        dfs = load_sqlite(sqlite_binary)
+        logger.debug("Loaded CLIP SQLite database (metadata-only open)")
+
+        if DEBUG:
+            dump_dfs_csv(dfs, base_name)
+
+        canvas = CanvasRecord.from_row(dfs["Canvas"].iloc[0])
+        canvas_size = (int(canvas.canvas_height), int(canvas.canvas_width))
+
+        record = augment_layer_df(dfs["Layer"])
+        return cls(record, 0, {}, canvas_size)

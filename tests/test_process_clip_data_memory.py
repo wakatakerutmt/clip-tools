@@ -29,9 +29,11 @@ def test_process_clip_data_empties_clip_data_as_it_goes(test000_clip_path, monke
 
     real_process_clip_data = processing_module.process_clip_data
 
-    def wrapped(name, clip_data, dfs, record, external_id_map):
+    def wrapped(name, clip_data, dfs, record, external_id_map, **kwargs):
         seen_dicts.append(clip_data)
-        return real_process_clip_data(name, clip_data, dfs, record, external_id_map)
+        return real_process_clip_data(
+            name, clip_data, dfs, record, external_id_map, **kwargs
+        )
 
     # Patch at BOTH the module where it's defined AND the api module that
     # imported it by name — ClipImage.open uses the latter reference.

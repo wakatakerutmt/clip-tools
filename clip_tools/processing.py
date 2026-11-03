@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -107,11 +107,28 @@ def process_clip_data(
     dfs: Dict[str, pd.DataFrame],
     layer_df: pd.DataFrame,
     external_id_map: Dict[str, ExternalIdEntry],
+    touched_layer_ids: Optional[Iterable[int]] = None,
 ) -> Tuple[Dict[int, LayerEntry], List[LayerEntry]]:
-    """Classify processed chunks into raster/vector layers and an auxiliary bucket."""
+    """Classify processed chunks into raster/vector layers and an auxiliary bucket.
+
+    When ``touched_layer_ids`` is given, layers whose ``MainId`` is not in that
+    set skip the per-layer raster buffer allocation: ``process_layer_blocks``
+    is not called for them and no entry is added to ``raster_dict``. During
+    composite, ``_leaf_raster`` returns ``None`` for those layers so they
+    render transparent, which is the correct behaviour when the consumer has
+    pre-determined that the layer will not participate (ADR 0016).
+
+    ``touched_layer_ids=None`` (the default) preserves the pre-ADR-0016
+    behaviour: every layer gets its raster built, byte-identical to prior
+    output.
+    """
     raster_dict: Dict[int, LayerEntry] = {}
     auxillary_list: List[LayerEntry] = []
     processed: set = set()
+
+    touched_set: Optional[Set[int]] = (
+        set(touched_layer_ids) if touched_layer_ids is not None else None
+    )
 
     # Iterate by popping so each layer's decompressed block bytes are freed
     # as soon as its raster buffer has been built. Without this, every
@@ -129,6 +146,22 @@ def process_clip_data(
             offscreen = dfs["Offscreen"][
                 dfs["Offscreen"]["BlockData"] == key.encode("ascii")
             ].iloc[0]
+
+            layer_id = offscreen["LayerId"]
+
+            # Fast-path skip (ADR 0016): if the consumer told us this layer
+            # won't participate in composite, drop the chunks straight away
+            # — never call process_layer_blocks for it. This is where the
+            # peak RSS saving comes from: a non-touched layer never
+            # allocates its full-canvas RGBA buffer.
+            if (
+                touched_set is not None
+                and layer_id != 0
+                and layer_id not in touched_set
+            ):
+                del value
+                continue
+
             blocks = sorted(value.items(), key=lambda x: x[0])
             # Drop the only remaining reference to the per-layer bytes dict so
             # it can be freed; ``blocks`` already holds the bytes it needs.
@@ -144,8 +177,6 @@ def process_clip_data(
 
             if DEBUG:
                 save_debug_layer_image(processed_layer_arr, name, key, "raster")
-
-            layer_id = offscreen["LayerId"]
 
             if layer_id == 0:
                 continue
@@ -215,13 +246,20 @@ def process_clip_data(
             # (``blocks`` already deleted above right after process_layer_blocks)
 
         elif isinstance(value, np.ndarray):
-            if DEBUG:
-                save_debug_layer_image(value, name, key, "vector")
-
             vector_object = dfs["VectorObjectList"][
                 dfs["VectorObjectList"]["VectorData"] == key.encode("ascii")
             ].iloc[0]
             layer_id = vector_object["LayerId"]
+
+            # Vector-layer skip path (ADR 0016): drop the already-rasterized
+            # vector buffer when the consumer said this layer won't
+            # participate. Mirrors the raster branch's touched check above.
+            if touched_set is not None and layer_id not in touched_set:
+                del value
+                continue
+
+            if DEBUG:
+                save_debug_layer_image(value, name, key, "vector")
 
             if layer_id not in layer_df["MainId"].values:
                 logger.debug(f"Skipping invalid layer: {layer_id}")
