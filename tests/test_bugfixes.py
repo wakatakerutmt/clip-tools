@@ -31,6 +31,13 @@ import pytest
 
 from clip_tools.api.clip_layer import ClipLayer
 from clip_tools.composite.compositor import _solid_fill_rgba
+from clip_tools.rendering import _has_implicit_pressure_flow
+from clip_tools.structs.blob_parsers import (
+    BrushEffector,
+    EffectorPressure,
+    EffectorSmooth,
+    EffectorVelocity,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -179,3 +186,63 @@ def test_solid_fill_returns_none_when_special_render_type_is_mismatched():
         }
     )
     assert _solid_fill_rgba(layer) is None
+
+
+# ---------------------------------------------------------------------------
+# _has_implicit_pressure_flow: CSP FlowEffector flags=0x01 interpretation
+# ---------------------------------------------------------------------------
+
+
+def _mk_brush(flow_effector):
+    """Minimal BrushStyle-ish shim exposing the single field the helper reads."""
+    return types.SimpleNamespace(flow_effector=flow_effector)
+
+
+def test_implicit_pressure_flow_detected_when_flags_bit0_only():
+    # Y4 sen's actual FlowEffector: 4-byte blob 00 00 00 01. parsed to
+    # BrushEffector(flags=1, every modulator None). This is the pattern
+    # that must trigger implicit pressure-flow modulation.
+    eff = BrushEffector(flags=0x1, pressure=None, velocity=None, smooth=None)
+    assert _has_implicit_pressure_flow(_mk_brush(eff)) is True
+
+
+def test_implicit_pressure_flow_rejected_for_none_effector():
+    assert _has_implicit_pressure_flow(_mk_brush(None)) is False
+
+
+def test_implicit_pressure_flow_rejected_when_flags_bit0_clear():
+    eff = BrushEffector(flags=0x0, pressure=None, velocity=None, smooth=None)
+    assert _has_implicit_pressure_flow(_mk_brush(eff)) is False
+
+
+def test_implicit_pressure_flow_rejected_when_explicit_pressure_struct_present():
+    # A brush with an explicit pressure curve already has its flow driven
+    # by pressure via apply_effector; the implicit modulator must NOT
+    # double-apply here.
+    eff = BrushEffector(
+        flags=0x1 | 0x10,  # bit 0 + EFFECTOR_FLAG_PRESSURE
+        pressure=EffectorPressure(min=0.0, curve_id=94),
+        velocity=None,
+        smooth=None,
+    )
+    assert _has_implicit_pressure_flow(_mk_brush(eff)) is False
+
+
+def test_implicit_pressure_flow_rejected_when_explicit_velocity_struct_present():
+    eff = BrushEffector(
+        flags=0x1 | 0x20,
+        pressure=None,
+        velocity=EffectorVelocity(min=1.0, curve_id=95),
+        smooth=None,
+    )
+    assert _has_implicit_pressure_flow(_mk_brush(eff)) is False
+
+
+def test_implicit_pressure_flow_rejected_when_explicit_smooth_struct_present():
+    eff = BrushEffector(
+        flags=0x1 | 0x40,
+        pressure=None,
+        velocity=None,
+        smooth=EffectorSmooth(min=0.0),
+    )
+    assert _has_implicit_pressure_flow(_mk_brush(eff)) is False
