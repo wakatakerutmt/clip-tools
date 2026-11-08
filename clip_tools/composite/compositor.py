@@ -480,13 +480,28 @@ def _crop_to_viewport(arr: np.ndarray, viewport: Viewport) -> np.ndarray:
 
 
 def _solid_fill_rgba(layer) -> Optional[np.ndarray]:
-    """Return canvas-sized float32 RGBA for a draw_color_enable solid-fill layer.
+    """Return canvas-sized float32 RGBA for a CSP paper ("用紙") solid-fill layer.
 
-    CSP's paper layer ("用紙") has no raster entry; its content is a flat
-    color stored in draw_color_main_red/green/blue scaled by 2^32-1.
+    CSP's paper layer has no raster entry; its content is a flat color
+    stored in draw_color_main_red/green/blue scaled by 2**32-1.
+
+    ``draw_color_enable == 1.0`` alone is NOT sufficient — a cel shading
+    layer like ``水`` / ``ピンク`` also carries its selected paint color
+    in the same fields even when it has no painted raster. For those, the
+    intent is "this layer would paint in this color if you drew on it,"
+    not "this layer fills the canvas with this color." Treating them as
+    solid fills makes clip-tools paint the whole canvas with their saved
+    color, which then overrides sibling layers (e.g., ``paper_yellow``
+    under GSA — kakidashi-kun #89).
+
+    The distinguishing marker is ``special_render_type == 20``, which CSP
+    sets on the paper-layer type (observed on top-level ``用紙``). Regular
+    pixel layers leave that field unset.
     """
     meta = layer.metadata
     if float(getattr(meta, "draw_color_enable", 0.0) or 0.0) != 1.0:
+        return None
+    if float(getattr(meta, "special_render_type", 0.0) or 0.0) != 20.0:
         return None
     scale = 1.0 / (2**32 - 1)
     r = scale * float(meta.draw_color_main_red or 0.0)
