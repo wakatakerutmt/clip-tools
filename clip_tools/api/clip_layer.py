@@ -137,9 +137,49 @@ class ClipLayer:
 
     @property
     def children_ids(self) -> List[int]:
-        return list(
-            self._record[self._record["ParentLayer"] == self.layer_id]["MainId"].values
-        )
+        """Children's ``MainId`` in CSP's bottom-up stack order.
+
+        Walks the ``LayerFirstChildIndex`` → ``LayerNextIndex`` linked
+        list stored in the raw .clip layer records: that chain IS CSP's
+        canonical bottom-up stack order (``LayerFirstChildIndex`` points
+        at the bottom-of-stack sibling drawn first, each ``LayerNextIndex``
+        step moves up one in z-order).
+
+        The DataFrame row order from SQLite is NOT reliable for stack
+        order — ``ParentLayer`` tagging only identifies membership, and
+        for many groups the row order just happens to coincide with the
+        linked-list order while for others (kakidashi-kun #89
+        ``wn_op_028_GSA/GSA``) it comes back reversed, which puts a
+        paper-tone layer above the cel instead of under it.
+
+        Sorting the DataFrame by an added ``StackIndex`` column is the
+        obvious shortcut but it surfaces unrelated bugs: top-level row
+        sentinels show up as extra "children" of the canvas root. Walking
+        the chain directly uses only ``self._meta`` (already on this
+        layer) and one dict lookup per step through ``_layer_map`` — it
+        is O(children) with no DataFrame scan, no extra column, and never
+        touches rows that aren't actually chained from this group.
+
+        Matches psd-tools' iteration convention (first = bottom = drawn
+        first), so the kakidashi-kun compositor pass gets paper_yellow
+        rendered under cels and ``layer_filter`` sets work the same way
+        they do on a PSDImage.
+        """
+        first = int(self.metadata.layer_first_child_index)
+        if first == 0:
+            return []
+        result: List[int] = []
+        current = first
+        while current != 0:
+            idx = self._layer_map.get(current)
+            if idx is None:
+                # Broken chain — the id doesn't correspond to a real
+                # row. Drop it (don't report a phantom child) and stop
+                # the walk rather than looping forever.
+                break
+            result.append(current)
+            current = int(self._record.loc[idx]["LayerNextIndex"])
+        return result
 
     @property
     def children_names(self) -> List[str]:
