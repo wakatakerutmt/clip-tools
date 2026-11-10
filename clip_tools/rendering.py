@@ -345,6 +345,49 @@ def disc_alpha_into(
         np.maximum(region, src_a, out=region)
 
 
+def _compute_stamp_dimensions(
+    brush: BrushStyle, brush_size: float, ss: int
+) -> Tuple[float, float]:
+    """Compute the per-stamp (long_axis, short_axis) in supersampled pixels.
+
+    ``ThicknessBase`` has three distinct meanings in CSP depending on brush
+    kind, which this function dispatches on:
+
+    - **Chisel / brush-tip** (``anti_alias == 0``): elliptical stamp. Long axis
+      stays at ``brush_size * ss``; short axis is compressed by
+      ``thickness_base`` (acting as the ellipse's aspect ratio).
+
+    - **Shaped / pattern-based** (``pattern_style > 0``): round stamp sized to
+      ``brush_size * ss``. The pattern image (see ``tex_mask``) already
+      encodes the brush's visual shape at its intended scale, so
+      ``ThicknessBase`` is *not* a size parameter here — applying
+      ``thickness^(1/3)`` as a scale factor shrinks each stamp catastrophically
+      when the authoring tool stored a small ``thickness_base`` for a hatching
+      or sketching brush (kakidashi-kun #84: brush 10949 with
+      ``brush_size=3`` and ``thickness_base=0.01`` had stamp_long collapsing
+      to 1.3px → ~7% of PSD's content coverage on LOSS/A2).
+
+    - **Standard pen** (``anti_alias > 0`` and ``pattern_style == 0``):
+      round stamp sized to ``brush_size * thickness_base^(1/3) * ss``. The
+      cube-root fit is the empirical mapping between CSP's authoring-side
+      thickness control and the rendered stamp diameter for disc-based
+      brushes.
+
+    Returns a ``(long_axis, short_axis)`` tuple; both equal ``stamp_long``
+    for non-elliptical brushes.
+    """
+    elliptical = brush.anti_alias == 0
+    if elliptical:
+        stamp_long = brush_size * ss
+        stamp_short = stamp_long * brush.thickness_base
+        return stamp_long, stamp_short
+    if brush.pattern_style > 0:
+        stamp_long = brush_size * ss
+        return stamp_long, stamp_long
+    stamp_long = brush_size * float(brush.thickness_base ** (1 / 3)) * ss
+    return stamp_long, stamp_long
+
+
 def _has_implicit_pressure_flow(brush: BrushStyle) -> bool:
     """Whether ``brush``'s ``FlowEffector`` encodes implicit linear
     pressure-flow modulation.
@@ -1215,20 +1258,9 @@ def render_vector_line_stamp(
         if not samples:
             continue
 
-        # ThicknessBase has two meanings depending on brush type:
-        # - For standard pens (AntiAlias > 0): sub-linear scale factor on the
-        #   stamp diameter (empirical cube-root fit).
-        # - For chisel/brush-tip brushes (AntiAlias == 0): aspect ratio of an
-        #   elliptical stamp — long axis stays brush_size, short axis is
-        #   brush_size × ThicknessBase.
-        elliptical = brush.anti_alias == 0
-        if elliptical:
-            stamp_long = brush_size * ss
-            stamp_short = stamp_long * brush.thickness_base
-        else:
-            stamp_long = brush_size * float(brush.thickness_base ** (1 / 3)) * ss
-            stamp_short = stamp_long
+        stamp_long, stamp_short = _compute_stamp_dimensions(brush, brush_size, ss)
         effective_size = stamp_long  # used for step_px and texture scaling
+        elliptical = brush.anti_alias == 0  # still needed in draw_stamp below
         # Per-stamp alpha is ``FlowBase``. ``TextureDensityBase`` belongs to
         # the secondary paper-grain overlay, not the primary stamp.
         per_stamp_alpha = brush.flow_base

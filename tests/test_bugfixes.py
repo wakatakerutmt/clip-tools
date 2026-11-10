@@ -31,7 +31,10 @@ import pytest
 
 from clip_tools.api.clip_layer import ClipLayer
 from clip_tools.composite.compositor import _solid_fill_rgba
-from clip_tools.rendering import _has_implicit_pressure_flow
+from clip_tools.rendering import (
+    _compute_stamp_dimensions,
+    _has_implicit_pressure_flow,
+)
 from clip_tools.structs.blob_parsers import (
     BrushEffector,
     EffectorPressure,
@@ -246,3 +249,71 @@ def test_implicit_pressure_flow_rejected_when_explicit_smooth_struct_present():
         smooth=EffectorSmooth(min=0.0),
     )
     assert _has_implicit_pressure_flow(_mk_brush(eff)) is False
+
+
+# ---------------------------------------------------------------------------
+# _compute_stamp_dimensions: ThicknessBase dispatch per brush kind
+# ---------------------------------------------------------------------------
+
+
+def _mk_stamp_brush(anti_alias, pattern_style, thickness_base):
+    """Minimal BrushStyle-ish shim for the three fields the helper reads."""
+    return types.SimpleNamespace(
+        anti_alias=anti_alias,
+        pattern_style=pattern_style,
+        thickness_base=thickness_base,
+    )
+
+
+def test_stamp_dimensions_standard_pen_applies_cube_root_thickness():
+    # Standard pen: anti_alias > 0 AND pattern_style == 0 → cube-root factor.
+    # With thickness_base = 1.0 the stamp is brush_size * ss (no shrink).
+    brush = _mk_stamp_brush(anti_alias=2, pattern_style=0, thickness_base=1.0)
+    long, short = _compute_stamp_dimensions(brush, brush_size=3.0, ss=2)
+    assert long == pytest.approx(6.0)
+    assert short == pytest.approx(6.0)
+
+
+def test_stamp_dimensions_standard_pen_with_small_thickness_shrinks():
+    # Standard pen with thickness = 0.125 → stamp_long = 3 * 0.5 * 2 = 3.0
+    brush = _mk_stamp_brush(anti_alias=2, pattern_style=0, thickness_base=0.125)
+    long, short = _compute_stamp_dimensions(brush, brush_size=3.0, ss=2)
+    assert long == pytest.approx(3.0)
+    assert short == pytest.approx(3.0)
+
+
+def test_stamp_dimensions_elliptical_uses_thickness_as_aspect_ratio():
+    # Chisel brush: anti_alias == 0 → short axis compressed, long axis full.
+    brush = _mk_stamp_brush(anti_alias=0, pattern_style=0, thickness_base=0.5)
+    long, short = _compute_stamp_dimensions(brush, brush_size=4.0, ss=2)
+    assert long == pytest.approx(8.0)
+    assert short == pytest.approx(4.0)
+
+
+def test_stamp_dimensions_shaped_brush_ignores_thickness_scaling():
+    # kakidashi-kun #84: shaped hatching brush 10949's actual params —
+    # brush_size=3, anti_alias=2, pattern_style=16 (texture-based),
+    # thickness_base=0.01. The old path applied thickness^(1/3) = 0.2154
+    # here, collapsing stamp_long from 6px to 1.3px. The fix: for shaped
+    # brushes, thickness_base is NOT a size parameter — the pattern image
+    # encodes the brush's visual shape at its own scale, so stamps stay
+    # at brush_size * ss regardless of thickness_base.
+    brush = _mk_stamp_brush(anti_alias=2, pattern_style=16, thickness_base=0.01)
+    long, short = _compute_stamp_dimensions(brush, brush_size=3.0, ss=2)
+    assert long == pytest.approx(6.0)
+    assert short == pytest.approx(6.0)
+    # And explicitly: the result must NOT be the old (buggy) value.
+    old_shrunk = 3.0 * (0.01 ** (1 / 3)) * 2
+    assert long != pytest.approx(old_shrunk)
+
+
+def test_stamp_dimensions_shaped_brush_with_full_thickness_matches_standard():
+    # When thickness_base == 1.0 the old and new formulas coincide, so a
+    # shaped brush with thickness=1.0 should yield the same stamp_long as
+    # a standard pen with thickness=1.0. Guards against the shaped path
+    # accidentally picking up a different base scale.
+    shaped = _mk_stamp_brush(anti_alias=2, pattern_style=16, thickness_base=1.0)
+    standard = _mk_stamp_brush(anti_alias=2, pattern_style=0, thickness_base=1.0)
+    long_shaped, _ = _compute_stamp_dimensions(shaped, brush_size=3.0, ss=2)
+    long_standard, _ = _compute_stamp_dimensions(standard, brush_size=3.0, ss=2)
+    assert long_shaped == pytest.approx(long_standard)
