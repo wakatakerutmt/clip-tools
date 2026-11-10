@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git workflow (STRICT)
+
+**main への全ての変更は PR 経由。例外無し。**
+
+- `git push origin main` / `git push * main*` は絶対にしない
+- revert / hotfix / typo 修正・1行コミット、どれも例外ではない
+- 正しい流れ: feature branch → commit → push → `gh pr create` → ユーザーの明示的な「マージして OK」待ち → merge
+- このリポジトリは GitHub ruleset で main が保護されており、direct push と force push と削除は技術的にも拒否される（ruleset id: 26043350）。ルールと技術的保護の二重体制。
+
 ## Project Overview
 
 clip-tools is a Python library for parsing CLIP Studio Paint files (`.clip` and `.psd`) and exporting structured layers for anime production workflows. It handles binary format parsing, layer compositing, and organizes exports by production type (genga, layout, background, camera, etc.).
