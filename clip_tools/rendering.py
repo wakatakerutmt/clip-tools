@@ -345,6 +345,39 @@ def disc_alpha_into(
         np.maximum(region, src_a, out=region)
 
 
+def _has_implicit_pressure_flow(brush: BrushStyle) -> bool:
+    """Whether ``brush``'s ``FlowEffector`` encodes implicit linear
+    pressure-flow modulation.
+
+    CSP stores ``FlowEffector`` as a 4-byte flags-only blob (bytes:
+    ``00 00 00 01``) when the brush enables pressure-driven flow but
+    leaves the explicit curve / min / velocity-max slots at their
+    defaults. Our ``parse_brush_effector`` returns a ``BrushEffector``
+    with ``flags == 0x1`` and every modulator slot ``None``. In that
+    state, CSP's own renderer still applies ``alpha *= pressure`` per
+    stamp (and transitions the stroke-local accumulator to OVER so
+    overlapping sub-unity stamps build up alpha gradually). Without
+    this treatment, a hard pen with low-pressure samples (typical
+    artist input ~0.2-0.5) renders as a fully-opaque silhouette
+    (kakidashi-kun #81: Y4 sen had 17,681 alpha=255 pixels vs 183 in
+    the matching PSD raster — PSD matches CSP output).
+
+    Returns True only when the FlowEffector has flags bit 0 set AND no
+    explicit pressure / velocity / smooth modulator struct was decoded.
+    A brush that also has an explicit pressure struct is already
+    handled by ``apply_effector`` (via the pressure curve lookup) and
+    must not be double-modulated here.
+    """
+    eff = brush.flow_effector
+    return (
+        eff is not None
+        and bool(eff.flags & 0x1)
+        and eff.pressure is None
+        and eff.velocity is None
+        and eff.smooth is None
+    )
+
+
 def composite_alpha_onto(
     buffer: np.ndarray,
     stroke_alpha: np.ndarray,
@@ -1314,6 +1347,20 @@ def render_vector_line_stamp(
         fast_radii: List[float] = []
         fast_opacities: List[float] = []
 
+        # Implicit pressure-flow modulation: see _has_implicit_pressure_flow
+        # for the rationale. Decided once per stroke (brush-level property,
+        # not per-sample) so the OVER accumulation choice below can use it
+        # without re-evaluating the condition in every stamp.
+        stroke_implicit_pressure_flow = _has_implicit_pressure_flow(brush)
+        # For strokes with implicit pressure modulation, each stamp's alpha
+        # is now sub-unity (scaled by pressure typically < 0.5). Overlapping
+        # stamps should accumulate via Porter-Duff OVER to build up alpha
+        # gradually along the stroke, matching CSP's native output. Without
+        # this, MAX accumulation would cap the silhouette at a single stamp's
+        # alpha (the highest-pressure sample) and lose the density that the
+        # artist's overlapping low-pressure strokes were building.
+        stroke_accumulate_over = stroke_implicit_pressure_flow or (brush.hardness < 0.9)
+
         def draw_stamp(s: VectorSample, tangent_rad: float) -> float:
             """Returns the per-stamp size so the caller can adjust step_px."""
             # Per-stamp curve point. Pressure clamped to a 0.1 floor so very-
@@ -1342,6 +1389,17 @@ def render_vector_line_stamp(
                 effective_size * size_mult * s.size * brush.texture_scale * shaped_scale
             )
             alpha = per_stamp_alpha * flow_mult * stroke_op
+            # CSP's `FlowEffector` with ``flags == 0x1`` (bit 0 set, no
+            # explicit pressure/velocity/smooth modulator struct) is an
+            # implicit linear pressure-flow modulation. Without applying
+            # this, a hard pen stroke whose stored pressure values stay
+            # below 1.0 (typical artist input: 0.2–0.5) renders with a
+            # fully-opaque alpha=1.0 silhouette, while CSP's own output
+            # for the same stroke keeps most pixels in the AA band
+            # (kakidashi-kun #81: Y4 sen had 17,681 fully-opaque pixels
+            # in clip-tools vs 183 in the matching PSD raster).
+            if stroke_implicit_pressure_flow:
+                alpha *= cp.pressure
             if use_analytic_disc:
                 assert stroke_alpha is not None
                 # Circular for hard pens, elliptical (rotated by RotationBase)
@@ -1372,7 +1430,7 @@ def render_vector_line_stamp(
                         brush.hardness,
                         base_rot,
                         alpha,
-                        accumulate=brush.hardness < 0.9,
+                        accumulate=stroke_accumulate_over,
                     )
                 return size
             rot = base_rot
@@ -1434,7 +1492,7 @@ def render_vector_line_stamp(
                 np.asarray(fast_radii, dtype=np.float64),
                 np.asarray(fast_opacities, dtype=np.float64),
                 float(brush.hardness),
-                bool(brush.hardness < 0.9),
+                bool(stroke_accumulate_over),
             )
 
         # For disc-stamped strokes we accumulated a silhouette via MAX; now
