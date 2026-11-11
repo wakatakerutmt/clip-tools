@@ -717,6 +717,8 @@ def stamp_pattern(
     opacity: float,
     color: Tuple[int, int, int],
     rotation_rad: float = 0.0,
+    grain: Optional[np.ndarray] = None,
+    grain_origin: Tuple[int, int] = (0, 0),
 ) -> None:
     """Over-composite a rotated-and-scaled grayscale mask onto an RGBA float buffer.
 
@@ -728,6 +730,18 @@ def stamp_pattern(
 
     Subpixel-accurate: the destination grid is sampled at fractional offsets
     so small stamps align to the sub-pixel stroke path, not rounded positions.
+
+    When ``grain`` is supplied, the stamp's per-pixel coverage is additionally
+    multiplied by the paper-grain tile sampled at the stamp's destination
+    coordinates — this is the shaped-brush path's analogue of the disc path's
+    ``stroke_alpha *= grain`` step. ``grain`` is a float32 array in [0, 1]
+    laid out in **buffer** coordinates with its ``[0, 0]`` cell at
+    ``grain_origin = (x0_in_buffer, y0_in_buffer)``, i.e. the stroke bbox's
+    top-left. Keeping grain-origin aligned to the stroke bbox means every
+    stamp inside a single stroke shares the same grain tile without
+    re-sampling, and two strokes whose bboxes overlap still see the same
+    grain where they share pixels because each one re-sampled the tile at
+    the same absolute canvas coords.
     """
     if size_x < 1.0 or size_y < 1.0:
         return
@@ -758,6 +772,12 @@ def stamp_pattern(
     sy = np.clip(u_y.astype(np.int32), 0, th - 1)
     src_a = (tex_mask[sy, sx].astype(np.float32) / 255.0) * opacity
     src_a = src_a * valid
+    if grain is not None:
+        gox, goy = grain_origin
+        gx0, gy0 = dx0 - gox, dy0 - goy
+        gh, gw = grain.shape
+        if gx0 >= 0 and gy0 >= 0 and gx0 + bw <= gw and gy0 + bh <= gh:
+            src_a = src_a * grain[gy0 : gy0 + bh, gx0 : gx0 + bw]
 
     dst = buffer[dy0:dy1, dx0:dx1]
     dst_a = dst[..., 3]
@@ -1538,6 +1558,34 @@ def render_vector_line_stamp(
             stroke_alpha = None
             stroke_alpha_origin = (0, 0)
 
+        # Shaped-brush paper-grain patch: sampled once over the stroke bbox
+        # and passed to every ``stamp_pattern`` call so the per-pixel paper
+        # grain attenuates each stamp's coverage as CSP does. Without this,
+        # shaped brushes 10949-class (LOSS/A2 nuri, Y4 yellow) lay full
+        # paint at ``texture_density_base * flow_base`` density and read
+        # as +14.7% over-saturated mustard yellow vs PSD (kakidashi-kun
+        # #84 Phase 2). Disc brushes already apply grain via
+        # ``stroke_alpha *= grain`` after the step loop — this is the
+        # orthogonal shaped-path hook (clip-tools fork #44 Phase 2).
+        shaped_grain: Optional[np.ndarray] = None
+        shaped_grain_origin: Tuple[int, int] = (0, 0)
+        if shaped and brush.texture_pattern and brush.texture_pattern in pattern_images:
+            tex_sec = pattern_images[brush.texture_pattern]
+            bright = getattr(brush, "texture_brightness", 0.0)
+            contrast = getattr(brush, "texture_contrast", 1.0)
+            shaped_grain = _sample_paper_grain_patch(
+                tex_sec,
+                sy1 - sy0,
+                sx1 - sx0,
+                sx0,
+                sy0,
+                brush.texture_scale,
+                ss,
+                brightness=bright,
+                contrast=contrast,
+            )
+            shaped_grain_origin = (sx0, sy0)
+
         # Cython fast path: for circular analytic-disc strokes, collect
         # the per-stamp (cx, cy, radius, opacity) during the step loop
         # and hand them to the Cython batch kernel in one call after the
@@ -1657,6 +1705,8 @@ def render_vector_line_stamp(
                 alpha,
                 color,
                 rot,
+                grain=shaped_grain,
+                grain_origin=shaped_grain_origin,
             )
             return size
 

@@ -39,6 +39,7 @@ from clip_tools.rendering import (
     _sample_paper_grain_patch,
     composite_alpha_onto,
     multiply_alpha_onto,
+    stamp_pattern,
 )
 import numpy as np
 from clip_tools.structs.blob_parsers import (
@@ -642,3 +643,245 @@ def test_sample_paper_grain_patch_identity_bc_leaves_tile_as_is():
         tex, 2, 2, 0, 0, 1.0, 1, brightness=0.0, contrast=1.0
     )
     assert np.allclose(g_fast, g_slow)
+
+
+# ---------------------------------------------------------------------------
+# stamp_pattern: per-pixel paper-grain for shaped brush path
+# (clip-tools fork #44 Phase 2, kakidashi-kun #84 continuation)
+#
+# Phase 1 only attached grain to the disc-stamped branch of
+# ``render_vector_line_stamp``; shaped brushes (``pattern_style > 0``) still
+# stamped at full coverage via ``stamp_pattern`` writing straight to ``buf``.
+# For Y4_13_302_GSA_systemtest LOSS/A2 nuri, shaped brush 10949 laid yellow
+# at ~1.147× PSD saturation. The fix: let ``stamp_pattern`` accept a grain
+# plane and multiply ``src_a`` by it per-pixel, same mechanism as the disc
+# path's ``stroke_alpha *= grain``.
+# ---------------------------------------------------------------------------
+
+
+def _stamp_pattern_baseline_vs_grain(grain_value: float):
+    """Compare a single ``stamp_pattern`` call with vs. without a uniform
+    ``grain`` patch. Returns ``(alpha_no_grain, alpha_with_grain)``."""
+    # 40×40 destination buffer, straight-alpha RGBA, initially empty.
+    buf_no = np.zeros((40, 40, 4), dtype=np.float32)
+    buf_yes = np.zeros((40, 40, 4), dtype=np.float32)
+    # 6×6 fully-opaque pattern mask — a square nib stamp.
+    tex_mask = np.full((6, 6), 255, dtype=np.uint8)
+    # Uniform grain patch over the full buffer, origin=(0, 0).
+    grain = np.full((40, 40), grain_value, dtype=np.float32)
+    kwargs = dict(
+        buffer=buf_no,
+        tex_mask=tex_mask,
+        cx=20.0,
+        cy=20.0,
+        size_x=10.0,
+        size_y=10.0,
+        opacity=0.5,
+        color=(255, 0, 0),
+        rotation_rad=0.0,
+    )
+    stamp_pattern(**kwargs)
+    kwargs.update(buffer=buf_yes, grain=grain, grain_origin=(0, 0))
+    stamp_pattern(**kwargs)
+    return buf_no[..., 3], buf_yes[..., 3]
+
+
+def test_stamp_pattern_with_uniform_half_grain_halves_coverage():
+    # Grain=0.5 over an opaque stamp must halve the per-pixel coverage
+    # vs a baseline stamp with no grain. This is the fundamental hook
+    # the shaped-brush fix relies on.
+    alpha_no, alpha_yes = _stamp_pattern_baseline_vs_grain(0.5)
+    # Only compare pixels where the baseline stamp actually painted.
+    mask = alpha_no > 1e-4
+    assert mask.any(), "baseline stamp must paint at least one pixel"
+    assert np.allclose(alpha_yes[mask], alpha_no[mask] * 0.5, atol=1e-5)
+
+
+def test_stamp_pattern_with_grain_ones_matches_no_grain():
+    # Grain identity (all 1.0) must bit-match the no-grain baseline so
+    # that opt-ing shaped brushes WITHOUT a texture_pattern into this
+    # path (grain=None) stays a no-op.
+    alpha_no, alpha_yes = _stamp_pattern_baseline_vs_grain(1.0)
+    assert np.allclose(alpha_yes, alpha_no, atol=1e-6)
+
+
+def test_stamp_pattern_grain_origin_maps_to_buffer_coords():
+    # Grain is laid out in BUFFER coords with its [0, 0] cell at
+    # ``grain_origin``. Shift the origin so the grain's half-attenuation
+    # band lines up with the right half of the stamp, and assert only
+    # the right-half pixels got halved.
+    buf_left = np.zeros((40, 40, 4), dtype=np.float32)
+    buf_right = np.zeros((40, 40, 4), dtype=np.float32)
+    tex_mask = np.full((6, 6), 255, dtype=np.uint8)
+    # Grain: left half = 1.0 (no attenuation), right half = 0.25.
+    grain = np.ones((40, 40), dtype=np.float32)
+    grain[:, 20:] = 0.25
+    stamp_pattern(
+        buf_left,
+        tex_mask,
+        20.0,
+        20.0,
+        10.0,
+        10.0,
+        0.6,
+        (0, 255, 0),
+        grain=grain,
+        grain_origin=(0, 0),
+    )
+    # No grain comparator — use a second stamp with grain=None.
+    buf_none = np.zeros((40, 40, 4), dtype=np.float32)
+    stamp_pattern(buf_none, tex_mask, 20.0, 20.0, 10.0, 10.0, 0.6, (0, 255, 0))
+    a_left = buf_left[..., 3]
+    a_none = buf_none[..., 3]
+    # Left-half painted pixels must be unchanged; right-half pixels must
+    # read ~0.25× the no-grain baseline.
+    mask_l = (a_none > 1e-4) & (np.arange(40)[None, :] < 20)
+    mask_r = (a_none > 1e-4) & (np.arange(40)[None, :] >= 20)
+    assert mask_l.any() and mask_r.any()
+    assert np.allclose(a_left[mask_l], a_none[mask_l], atol=1e-5)
+    assert np.allclose(a_left[mask_r], a_none[mask_r] * 0.25, atol=1e-5)
+
+
+def _mk_shaped_brush(
+    texture_pattern: int,
+    texture_density_base: float = 1.0,
+    texture_scale: float = 1.0,
+    interval_base: float = 5.0,
+) -> "object":
+    """Minimal BrushStyle for a line-stamp shaped brush, sized so the
+    ``render_vector_line_stamp`` dispatcher takes the shaped (pattern_style>0)
+    branch. ``spray_flag=0`` keeps it on the line-stamp path."""
+    from clip_tools.types import BrushStyle
+
+    return BrushStyle(
+        main_id=1,
+        pattern_style=1,
+        texture_pattern=texture_pattern,
+        hardness=1.0,
+        thickness_base=1.0,
+        anti_alias=2,
+        flow_base=1.0,
+        interval_base=interval_base,
+        auto_interval_type=0,
+        rotation_base=0.0,
+        rotation_random=0.0,
+        rotation_effector=0,
+        rotation_in_spray_base=0.0,
+        rotation_effector_in_spray=0,
+        rotation_random_in_spray=0.0,
+        texture_scale=texture_scale,
+        texture_rotate=0.0,
+        texture_offset_x=0.0,
+        texture_offset_y=0.0,
+        texture_density_base=texture_density_base,
+        composite_mode=0,
+        spray_flag=0,
+        spray_size_base=0.0,
+        spray_density_base=0.0,
+        spray_bias=0.0,
+    )
+
+
+def _mk_single_stamp_stroke(brush_size: float = 12.0) -> "object":
+    """A near-degenerate 2-point stroke that produces exactly one shaped
+    stamp (interval_base is high enough that the step accumulator never
+    fires a second stamp). This keeps the per-pixel alpha in a non-
+    saturated regime so grain attenuation is measurable on the output."""
+    from clip_tools.constants import VectorType
+    from clip_tools.types import VectorPoint, VectorStroke
+
+    return VectorStroke(
+        vtype=VectorType.STANDARD,
+        color=(200, 100, 50),
+        stroke_opacity=1.0,
+        brush_size=brush_size,
+        brush_id=1,
+        points=[
+            VectorPoint(x=50.0, y=30.0, pressure=1.0),
+            VectorPoint(x=51.0, y=30.0, pressure=1.0),
+        ],
+        random_seed=42,
+    )
+
+
+def _render_shaped_single_stroke(
+    monkeypatch,
+    texture_pattern: int,
+    grain_tex: np.ndarray | None,
+    interval_base: float = 200.0,
+):
+    """Drive ``render_vector_line_stamp`` with a single shaped-brush stroke,
+    patching ``default_brush`` so no DataFrame plumbing is needed. Returns
+    the rendered RGBA uint8 canvas. ``interval_base=200`` is big enough that
+    the 1-pixel span between the two sample points never trips step_px, so
+    only the initial stamp fires — a predictable single-stamp footprint."""
+    import pandas as pd
+    import clip_tools.rendering as rendering
+
+    brush = _mk_shaped_brush(
+        texture_pattern=texture_pattern, interval_base=interval_base
+    )
+    monkeypatch.setattr(rendering, "default_brush", lambda _bid: brush)
+    # A single-stamp 8x8 pattern (opaque square nib).
+    nib = np.full((8, 8), 255, dtype=np.uint8)
+    pattern_images = {100: nib}
+    if grain_tex is not None and texture_pattern > 0:
+        pattern_images[texture_pattern] = grain_tex
+    # BrushPatternStyle maps pattern_style=1 → image id 100 (the nib).
+    bps = pd.DataFrame(
+        [
+            {
+                "MainId": 1,
+                "ImageIndex": (100).to_bytes(4, "big"),
+                "OrderType": 0,
+                "Reverse2": 0,
+            }
+        ]
+    )
+    dfs = {"BrushPatternStyle": bps}
+    stroke = _mk_single_stamp_stroke()
+    rendered, skipped = rendering.render_vector_line_stamp(
+        [stroke], (60, 100), None, pattern_images, dfs
+    )
+    assert not skipped
+    return rendered
+
+
+def test_shaped_path_applies_paper_grain_when_texture_pattern_present(monkeypatch):
+    # With a shaped brush carrying texture_pattern > 0 and a half-value
+    # grain tile, the painted alpha on a single-stamp footprint must come
+    # back at roughly half the no-grain baseline. This is the integration
+    # hook that closes Phase 2 of kakidashi-kun #84 — shaped brush 10949
+    # on the LOSS/A2 nuri was over-saturating because grain never reached
+    # the shaped branch.
+    half_tex = np.full((4, 4), 128, dtype=np.uint8)  # ≈ 0.502 grain
+    img_no_grain = _render_shaped_single_stroke(
+        monkeypatch, texture_pattern=0, grain_tex=None
+    )
+    img_with_grain = _render_shaped_single_stroke(
+        monkeypatch, texture_pattern=99, grain_tex=half_tex
+    )
+    a_no = img_no_grain[..., 3].astype(np.float32)
+    a_yes = img_with_grain[..., 3].astype(np.float32)
+    mask = a_no > 10  # compare on pixels the baseline stroke actually painted
+    assert mask.sum() > 20, (
+        f"expected the test stroke to paint a visible footprint "
+        f"(got {int(mask.sum())} painted pixels)"
+    )
+    # 128/255 ≈ 0.502; allow slack for CLIP's floor(alpha*256) step +
+    # supersample reduce quantisation on single-stamp coverage.
+    ratio = a_yes[mask].mean() / a_no[mask].mean()
+    assert 0.40 < ratio < 0.60, (
+        f"shaped-path grain did not attenuate as expected; ratio={ratio:.3f}"
+    )
+
+
+def test_shaped_path_no_grain_when_texture_pattern_zero(monkeypatch):
+    # Regression: a shaped brush with texture_pattern=0 (the brush has
+    # no paper grain enabled) must render identically to the pre-Phase-2
+    # baseline — i.e. the grain-sampling branch is skipped entirely so
+    # brushes authored without a secondary paper tile can't accidentally
+    # pay the sampling cost or get modulated.
+    img_a = _render_shaped_single_stroke(monkeypatch, texture_pattern=0, grain_tex=None)
+    img_b = _render_shaped_single_stroke(monkeypatch, texture_pattern=0, grain_tex=None)
+    assert np.array_equal(img_a, img_b)
