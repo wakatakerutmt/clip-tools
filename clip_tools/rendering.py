@@ -388,6 +388,47 @@ def _compute_stamp_dimensions(
     return stamp_long, stamp_long
 
 
+def _compute_stamp_size(
+    brush: BrushStyle,
+    effective_size: float,
+    size_mult: float,
+    sample_size: float,
+    shaped_scale: float,
+) -> float:
+    """Final per-stamp long axis for the rasterizer's draw loop.
+
+    Factors:
+    - ``effective_size``: brush-level stamp long axis from
+      ``_compute_stamp_dimensions``.
+    - ``size_mult``: per-sample size-effector output or the ``lock_size``
+      override value.
+    - ``sample_size``: the sample's recorded size.
+    - ``shaped_scale``: per-stroke shaped-brush scale constant.
+
+    ``brush.texture_scale`` is deliberately NOT a factor here. It is CSP's
+    *secondary canvas-grain tile* scale — the rate at which the paper
+    texture tiles across the canvas, applied inside this same renderer
+    when the secondary grain is composited (see the
+    ``secondary_tex is not None`` branch). Historically it was multiplied
+    into stamp size as if it were a nib scale, which collapsed the
+    rendered stroke for any brush that the artist had tuned down the
+    canvas grain on:
+
+    - Shaped hatching brushes with ``texture_scale=0.28`` had their 6px
+      stamp drop to ~1.7px (kakidashi-kun #84, LOSS/A2 nuri over-collapse
+      masked by compensating errors).
+    - A standard pen whose brush carried any canvas texture (e.g. brush
+      id 10948, ``texture_scale=0.25``) had 2.4px stamps drop to 0.6px
+      sub-pixel, which the supersample reduce then zeroed — the line
+      disappeared entirely from the rendered output.
+
+    The ``brush`` argument stays in the signature so regression tests
+    can assert this invariant by varying ``texture_scale``.
+    """
+    del brush  # texture_scale deliberately not consumed; see docstring.
+    return effective_size * size_mult * sample_size * shaped_scale
+
+
 def _has_implicit_pressure_flow(brush: BrushStyle) -> bool:
     """Whether ``brush``'s ``FlowEffector`` encodes implicit linear
     pressure-flow modulation.
@@ -1310,7 +1351,7 @@ def render_vector_line_stamp(
         #
         # The upper bound on stamp radius has to cover every possible stamp
         # the loop below might lay down:
-        #     actual = effective_size × size_mult × s.size × texture_scale × shaped_scale
+        #     actual = effective_size × size_mult × s.size × shaped_scale
         # ``size_mult`` comes from the size-effector chain (typically peaks
         # near 2.0 for pressure-driven brushes) and gets replaced by ``s.size``
         # itself when a sample has the per-control lock_size bit — that
@@ -1318,6 +1359,11 @@ def render_vector_line_stamp(
         # 4.0 cap on size_mult and ``max_s_size²`` so the bbox stays correct
         # even for aggressive size curves without re-scanning the samples.
         # ``+4`` absorbs AA bleed and the elliptical rotation diagonal.
+        # ``brush.texture_scale`` is NOT part of the actual stamp size (see
+        # ``_compute_stamp_size``); the ``max(1.0, texture_scale)`` factor
+        # below is a historical conservative upper bound retained so an
+        # unusual ``texture_scale > 1.0`` can't under-size the bbox during
+        # the transition.
         if not samples:
             continue
         xs = [s.x * ss for s in samples]
@@ -1417,8 +1463,8 @@ def render_vector_line_stamp(
                 size_mult = s.size
             if s.lock_flow:
                 flow_mult = s.flow
-            size = (
-                effective_size * size_mult * s.size * brush.texture_scale * shaped_scale
+            size = _compute_stamp_size(
+                brush, effective_size, size_mult, s.size, shaped_scale
             )
             alpha = per_stamp_alpha * flow_mult * stroke_op
             # CSP's `FlowEffector` with ``flags == 0x1`` (bit 0 set, no

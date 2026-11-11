@@ -33,6 +33,7 @@ from clip_tools.api.clip_layer import ClipLayer
 from clip_tools.composite.compositor import _solid_fill_rgba
 from clip_tools.rendering import (
     _compute_stamp_dimensions,
+    _compute_stamp_size,
     _has_implicit_pressure_flow,
 )
 from clip_tools.structs.blob_parsers import (
@@ -317,3 +318,61 @@ def test_stamp_dimensions_shaped_brush_with_full_thickness_matches_standard():
     long_shaped, _ = _compute_stamp_dimensions(shaped, brush_size=3.0, ss=2)
     long_standard, _ = _compute_stamp_dimensions(standard, brush_size=3.0, ss=2)
     assert long_shaped == pytest.approx(long_standard)
+
+
+# ---------------------------------------------------------------------------
+# _compute_stamp_size: brush.texture_scale must NOT scale the stamp size.
+# ---------------------------------------------------------------------------
+
+
+def _mk_size_brush(texture_scale):
+    """Minimal BrushStyle-ish shim — the helper only reads ``texture_scale``,
+    and it must refuse to consume it (asserted below)."""
+    return types.SimpleNamespace(texture_scale=texture_scale)
+
+
+def test_stamp_size_identity_when_all_factors_are_one():
+    # Sanity floor: identity inputs produce identity output.
+    brush = _mk_size_brush(texture_scale=1.0)
+    size = _compute_stamp_size(
+        brush,
+        effective_size=10.0,
+        size_mult=1.0,
+        sample_size=1.0,
+        shaped_scale=1.0,
+    )
+    assert size == pytest.approx(10.0)
+
+
+def test_stamp_size_multiplies_its_four_documented_factors():
+    # The helper is a pure four-way product of the documented factors —
+    # nothing else.
+    brush = _mk_size_brush(texture_scale=1.0)
+    size = _compute_stamp_size(
+        brush,
+        effective_size=10.0,
+        size_mult=2.0,
+        sample_size=0.5,
+        shaped_scale=3.0,
+    )
+    assert size == pytest.approx(10.0 * 2.0 * 0.5 * 3.0)
+
+
+def test_stamp_size_ignores_brush_texture_scale():
+    # kakidashi-kun #84 continuation: brush.texture_scale is CSP's
+    # secondary canvas-grain tile scale, not a per-stamp nib scale. The
+    # old code path multiplied it into the stamp size, which collapsed
+    # strokes for brushes whose author had tuned down the canvas grain
+    # — most severely brush id 10948 with texture_scale=0.25 (Y4 LOSS
+    # sen) whose 2.4 px stamps dropped to 0.6 px (sub-pixel, zeroed by
+    # the supersample reduce, line disappeared from output).
+    low = _mk_size_brush(texture_scale=0.25)
+    quarter = _mk_size_brush(texture_scale=0.28)
+    unit = _mk_size_brush(texture_scale=1.0)
+    s_low = _compute_stamp_size(low, 10.0, 1.0, 1.0, 1.0)
+    s_quarter = _compute_stamp_size(quarter, 10.0, 1.0, 1.0, 1.0)
+    s_unit = _compute_stamp_size(unit, 10.0, 1.0, 1.0, 1.0)
+    assert s_low == pytest.approx(s_unit)
+    assert s_quarter == pytest.approx(s_unit)
+    # And explicitly: the result must NOT be the old (buggy) scaled value.
+    assert s_low != pytest.approx(10.0 * 0.25)
