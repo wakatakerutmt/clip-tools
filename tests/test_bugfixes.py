@@ -36,7 +36,10 @@ from clip_tools.rendering import (
     _compute_stamp_dimensions,
     _compute_stamp_size,
     _has_implicit_pressure_flow,
+    composite_alpha_onto,
+    multiply_alpha_onto,
 )
+import numpy as np
 from clip_tools.structs.blob_parsers import (
     BrushEffector,
     EffectorPressure,
@@ -443,3 +446,78 @@ def test_stamp_alpha_density_ignored_when_pattern_is_zero_even_with_nondefault_d
         brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
     )
     assert alpha == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# multiply_alpha_onto: per-stroke MULTIPLY composite for composite_mode=2
+# (clip-tools fork #44, LOSA/A2 sen over-darkness)
+# ---------------------------------------------------------------------------
+
+
+def _mk_rgba(h, w, r, g, b, a):
+    buf = np.zeros((h, w, 4), dtype=np.float32)
+    buf[..., 0] = r
+    buf[..., 1] = g
+    buf[..., 2] = b
+    buf[..., 3] = a
+    return buf
+
+
+def test_multiply_alpha_onto_full_cover_dark_src_darkens_bright_dst():
+    # Full-opacity MULTIPLY of dark (0.1,0.1,0.1) onto bright (1.0,1.0,1.0)
+    # gives the dark color (equivalent to replacing when alpha=1 and dst=white).
+    buf = _mk_rgba(1, 1, 1.0, 1.0, 1.0, 1.0)
+    stroke_alpha = np.ones((1, 1), dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (26, 26, 26))  # 0.102 normalized
+    assert buf[0, 0, 0] == pytest.approx(26 / 255.0, abs=1e-3)
+    assert buf[0, 0, 1] == pytest.approx(26 / 255.0, abs=1e-3)
+    assert buf[0, 0, 2] == pytest.approx(26 / 255.0, abs=1e-3)
+
+
+def test_multiply_alpha_onto_zero_alpha_is_identity():
+    # With stroke_alpha=0, the buffer must be unchanged — any color.
+    buf = _mk_rgba(1, 1, 0.5, 0.6, 0.7, 1.0)
+    stroke_alpha = np.zeros((1, 1), dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (0, 0, 0))
+    assert buf[0, 0, 0] == pytest.approx(0.5)
+    assert buf[0, 0, 1] == pytest.approx(0.6)
+    assert buf[0, 0, 2] == pytest.approx(0.7)
+
+
+def test_multiply_alpha_onto_half_cover_half_darkens():
+    # Half-opacity MULTIPLY of half-brightness onto bright dst:
+    # out = dst * (1 - 0.5 * (1 - 0.5)) = 1.0 * 0.75 = 0.75
+    buf = _mk_rgba(1, 1, 1.0, 1.0, 1.0, 1.0)
+    stroke_alpha = np.full((1, 1), 0.5, dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (128, 128, 128))  # 0.502 normalized
+    expected = 1.0 * (1.0 - 0.5 * (1.0 - 128 / 255.0))
+    assert buf[0, 0, 0] == pytest.approx(expected, abs=1e-3)
+
+
+def test_multiply_alpha_onto_two_overlapping_strokes_darken_multiplicatively():
+    # MULTIPLY is a repeated per-channel scaling — overlapping strokes
+    # compound the darkening factor, they do NOT saturate alpha toward 1
+    # the way OVER accumulation does. Two half-opacity passes of a mid
+    # dark color (0.251) on bright dst (1.0) each apply the scale factor
+    # (1 - 0.5 * (1 - 0.251)) = 0.625, so the result is exactly the
+    # product 0.625^2.
+    buf = _mk_rgba(1, 1, 1.0, 1.0, 1.0, 1.0)
+    stroke_alpha = np.full((1, 1), 0.5, dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (64, 64, 64))
+    v1 = float(buf[0, 0, 0])
+    multiply_alpha_onto(buf, stroke_alpha, (64, 64, 64))
+    v2 = float(buf[0, 0, 0])
+    scale = 1.0 - 0.5 * (1.0 - 64 / 255.0)
+    assert v1 == pytest.approx(scale, abs=1e-3)
+    assert v2 == pytest.approx(scale * scale, abs=1e-3)
+    assert v2 < v1  # each extra pass darkens further
+
+
+def test_multiply_alpha_onto_alpha_channel_follows_source_over():
+    # The alpha channel composition is unchanged by MULTIPLY — the stroke
+    # silhouette still covers the dst using source-over.
+    buf = _mk_rgba(1, 1, 1.0, 1.0, 1.0, 0.5)
+    stroke_alpha = np.full((1, 1), 0.3, dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (100, 100, 100))
+    expected_a = 0.3 + 0.5 * (1.0 - 0.3)
+    assert buf[0, 0, 3] == pytest.approx(expected_a)

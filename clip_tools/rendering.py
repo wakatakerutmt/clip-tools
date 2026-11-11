@@ -525,6 +525,42 @@ def composite_alpha_onto(
     buffer[..., 3] = out_a
 
 
+def multiply_alpha_onto(
+    buffer: np.ndarray,
+    stroke_alpha: np.ndarray,
+    color: Tuple[int, int, int],
+) -> None:
+    """MULTIPLY-composite a solid-color stroke onto the RGBA buffer.
+
+    Mirror of :func:`composite_alpha_onto` for ``brush.composite_mode == 2``
+    (CSP's MULTIPLY). The stroke darkens the underlying buffer by the
+    stroke color where the stroke covers, weighted by the stroke's alpha
+    mask. In contrast to OVER (which replaces dst with src where the
+    stroke is opaque), MULTIPLY keeps the dst showing through — just
+    darkened — which is how sen ink layers in CSP preserve the paper
+    color behind them.
+
+    Per-channel formula (standard CSP MULTIPLY, alpha-weighted):
+        out_rgb = dst_rgb * ((1 - a_s) + a_s * src_rgb)
+                = dst_rgb * (1 - a_s * (1 - src_rgb))
+    Alpha composition stays source-over because the stroke's silhouette
+    is unchanged — only its colorimetric effect switches.
+
+    No native fast path yet; the OVER fast path (:data:`
+    _composite_alpha_onto_fast`) hard-codes the OVER formula and does
+    not take a composite mode. The per-stroke numpy path is small
+    relative to the stamp loop, and MULTIPLY brushes are a minority of
+    strokes in real files.
+    """
+    a_s = stroke_alpha
+    dst_a = buffer[..., 3]
+    out_a = a_s + dst_a * (1.0 - a_s)
+    for ch in range(3):
+        src = color[ch] / 255.0
+        buffer[..., ch] = buffer[..., ch] * (1.0 - a_s * (1.0 - src))
+    buffer[..., 3] = out_a
+
+
 def q15_stamp_pattern_into_alpha(
     alpha_buf: np.ndarray,
     pattern: np.ndarray,
@@ -1618,7 +1654,14 @@ def render_vector_line_stamp(
             sx0, sy0 = stroke_alpha_origin
             sh, sw = stroke_alpha.shape
             buf_region = buf[sy0 : sy0 + sh, sx0 : sx0 + sw]
-            composite_alpha_onto(buf_region, stroke_alpha, color)
+            # ``brush.composite_mode`` selects the per-stroke blend
+            # formula. CSP exposes a dozen+ modes; so far only Normal (0)
+            # and Multiply (2) are observed on sen/nuri brushes in the
+            # fixture set, and only Multiply changes behavior from OVER.
+            if brush.composite_mode == 2:
+                multiply_alpha_onto(buf_region, stroke_alpha, color)
+            else:
+                composite_alpha_onto(buf_region, stroke_alpha, color)
 
     # Finalize the raster. For a vector-heavy file whose strokes only cover
     # a small region of the canvas, the full-canvas ss-reduce and uint8
