@@ -478,6 +478,48 @@ def _compute_stamp_alpha(
     return alpha
 
 
+def _sample_paper_grain_patch(
+    texture: np.ndarray,
+    bbox_h: int,
+    bbox_w: int,
+    bbox_x0_ss: int,
+    bbox_y0_ss: int,
+    texture_scale: float,
+    ss: int,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+) -> np.ndarray:
+    """Sample a paper-grain texture at canvas coordinates for a stroke bbox.
+
+    Returns a ``(bbox_h, bbox_w)`` float32 array in ``[0, 1]``: the
+    per-pixel multiplier to apply to the stroke's alpha plane before
+    compositing. Mirrors the spray path's grain sampling at ~L1263 but
+    operates on a stroke-local bbox (so vector-heavy files do not pay
+    for the full-canvas grain each stroke).
+
+    The tile is addressed in **absolute canvas ss coords** (not bbox-
+    local), so the grain pattern stays aligned across overlapping
+    strokes exactly as CSP does — two neighbouring strokes see the
+    same grain where they share pixels.
+
+    Brightness / contrast are preprocessed as
+    ``t' = clip((t - 0.5) * contrast + 0.5 + brightness, 0, 1)``
+    to match the spray path (and the CSP brush authoring UI's
+    TextureBrightness / TextureContrast sliders). Both default to
+    identity when the brush has no explicit values.
+    """
+    th, tw = texture.shape
+    scale = max(0.001, texture_scale)
+    ys = np.arange(bbox_y0_ss, bbox_y0_ss + bbox_h)
+    xs = np.arange(bbox_x0_ss, bbox_x0_ss + bbox_w)
+    v_idx = (ys / (ss * scale)).astype(np.int32) % th
+    u_idx = (xs / (ss * scale)).astype(np.int32) % tw
+    grain = texture[v_idx[:, None], u_idx[None, :]].astype(np.float32) / 255.0
+    if brightness != 0.0 or contrast != 1.0:
+        grain = np.clip((grain - 0.5) * contrast + 0.5 + brightness, 0.0, 1.0)
+    return grain
+
+
 def _has_implicit_pressure_flow(brush: BrushStyle) -> bool:
     """Whether ``brush``'s ``FlowEffector`` encodes implicit linear
     pressure-flow modulation.
@@ -1665,6 +1707,38 @@ def render_vector_line_stamp(
         if use_analytic_disc and stroke_alpha is not None:
             sx0, sy0 = stroke_alpha_origin
             sh, sw = stroke_alpha.shape
+            # Apply the brush's paper-grain texture per-pixel to the
+            # stroke alpha plane BEFORE compositing. This is the
+            # orthogonal axis to ``brush.texture_density_base`` (per-
+            # stamp scalar for shaped brushes, applied in
+            # ``_compute_stamp_alpha``): the grain modulates per-pixel
+            # coverage via the brush's paper pattern, driving nuri /
+            # soft-pen alpha down to CSP-matching levels. Mirrors the
+            # spray path's grain application at ~L1300.
+            if brush.texture_pattern and brush.texture_pattern in pattern_images:
+                tex = pattern_images[brush.texture_pattern]
+                bright = (
+                    brush.texture_brightness
+                    if hasattr(brush, "texture_brightness")
+                    else 0.0
+                )
+                contrast = (
+                    brush.texture_contrast
+                    if hasattr(brush, "texture_contrast")
+                    else 1.0
+                )
+                grain = _sample_paper_grain_patch(
+                    tex,
+                    sh,
+                    sw,
+                    sx0,
+                    sy0,
+                    brush.texture_scale,
+                    ss,
+                    brightness=bright,
+                    contrast=contrast,
+                )
+                stroke_alpha *= grain
             buf_region = buf[sy0 : sy0 + sh, sx0 : sx0 + sw]
             # ``brush.composite_mode`` selects the per-stroke blend
             # formula. CSP exposes a dozen+ modes; so far only Normal (0)

@@ -36,6 +36,7 @@ from clip_tools.rendering import (
     _compute_stamp_dimensions,
     _compute_stamp_size,
     _has_implicit_pressure_flow,
+    _sample_paper_grain_patch,
     composite_alpha_onto,
     multiply_alpha_onto,
 )
@@ -552,3 +553,92 @@ def test_multiply_alpha_onto_alpha_channel_follows_source_over():
     multiply_alpha_onto(buf, stroke_alpha, (100, 100, 100))
     expected_a = 0.3 + 0.5 * (1.0 - 0.3)
     assert buf[0, 0, 3] == pytest.approx(expected_a)
+
+
+# ---------------------------------------------------------------------------
+# _sample_paper_grain_patch: per-pixel paper-grain modulation for line_stamp
+# path (clip-tools fork #44 Phase 2, kakidashi-kun #84 continuation)
+# ---------------------------------------------------------------------------
+
+
+def test_sample_paper_grain_patch_returns_unit_interval_floats():
+    # A uniform 128-value grain tile sampled anywhere must come back as
+    # 128/255 ≈ 0.502 (no brightness/contrast adjustment).
+    tex = np.full((8, 8), 128, dtype=np.uint8)
+    grain = _sample_paper_grain_patch(
+        tex,
+        bbox_h=4,
+        bbox_w=4,
+        bbox_x0_ss=0,
+        bbox_y0_ss=0,
+        texture_scale=1.0,
+        ss=1,
+    )
+    assert grain.shape == (4, 4)
+    assert grain.dtype == np.float32
+    assert float(grain.min()) == pytest.approx(128 / 255.0, abs=1e-5)
+    assert float(grain.max()) == pytest.approx(128 / 255.0, abs=1e-5)
+
+
+def test_sample_paper_grain_patch_wraps_with_absolute_canvas_origin():
+    # The sampler must address the tile in ABSOLUTE canvas ss coords so
+    # two neighbouring strokes see the same grain where their bboxes
+    # overlap. Create a 2×2 tile with a known pattern, then sample two
+    # 1×1 patches at adjacent ss coords and assert they pick up the
+    # right tile cells.
+    tex = np.array([[10, 200], [50, 150]], dtype=np.uint8)
+    # Patch at (0, 0) → tile cell (0, 0) → 10/255
+    g0 = _sample_paper_grain_patch(tex, 1, 1, 0, 0, 1.0, 1)
+    assert float(g0[0, 0]) == pytest.approx(10 / 255.0)
+    # Patch at (1, 0) → tile cell (0, 1) → 200/255
+    g1 = _sample_paper_grain_patch(tex, 1, 1, 1, 0, 1.0, 1)
+    assert float(g1[0, 0]) == pytest.approx(200 / 255.0)
+    # Patch at (0, 3) wraps → tile cell (1, 0) (3 % 2 = 1) → 50/255
+    g2 = _sample_paper_grain_patch(tex, 1, 1, 0, 3, 1.0, 1)
+    assert float(g2[0, 0]) == pytest.approx(50 / 255.0)
+
+
+def test_sample_paper_grain_patch_scales_tile_by_texture_scale_and_ss():
+    # Tile scale controls the tiling period. A 2×2 tile with
+    # texture_scale=0.5 at ss=2 means each tile cell spans
+    # (ss * scale) = 1 ss-pixel. At ss=4, same tex_scale → 2 ss-pixels
+    # per cell. Sample a 1-wide patch straddling the boundary.
+    tex = np.array([[10, 200], [50, 150]], dtype=np.uint8)
+    # scale=0.5, ss=2 → divisor (ss*scale)=1.0 → each cell = 1 ss-px.
+    # Patches at ss x=0 and x=1 must pick cells (0,0) and (0,1).
+    g0 = _sample_paper_grain_patch(tex, 1, 1, 0, 0, 0.5, 2)
+    g1 = _sample_paper_grain_patch(tex, 1, 1, 1, 0, 0.5, 2)
+    assert float(g0[0, 0]) == pytest.approx(10 / 255.0)
+    assert float(g1[0, 0]) == pytest.approx(200 / 255.0)
+
+
+def test_sample_paper_grain_patch_applies_brightness_and_contrast():
+    # Brightness/contrast curve: t' = clip((t - 0.5) * c + 0.5 + b, 0, 1)
+    # A uniform 128 tile → t = 0.502. With contrast=2, brightness=0:
+    #   t' = clip((0.502 - 0.5) * 2 + 0.5, 0, 1) ≈ 0.504
+    # With brightness=0.5:
+    #   t' = clip(0.502 - 0.5 + 0.5 + 0.5, 0, 1) = 1.0 (clipped)
+    tex = np.full((4, 4), 128, dtype=np.uint8)
+    g_contrast = _sample_paper_grain_patch(
+        tex, 1, 1, 0, 0, 1.0, 1, brightness=0.0, contrast=2.0
+    )
+    assert float(g_contrast[0, 0]) == pytest.approx(
+        np.clip((128 / 255.0 - 0.5) * 2.0 + 0.5, 0.0, 1.0), abs=1e-5
+    )
+    g_bright_clipped = _sample_paper_grain_patch(
+        tex, 1, 1, 0, 0, 1.0, 1, brightness=0.5, contrast=1.0
+    )
+    assert float(g_bright_clipped[0, 0]) == pytest.approx(1.0)
+
+
+def test_sample_paper_grain_patch_identity_bc_leaves_tile_as_is():
+    # When brightness == 0 and contrast == 1 we must take the fast path
+    # that does NOT run the clip+arithmetic (the fast path returns the
+    # raw tile sample straight from the texture). Fast-path bit-matches
+    # the slow path at b=0,c=1, verified via identical output.
+    tex = np.array([[10, 200], [50, 150]], dtype=np.uint8)
+    g_fast = _sample_paper_grain_patch(tex, 2, 2, 0, 0, 1.0, 1)
+    g_slow = _sample_paper_grain_patch(
+        tex, 2, 2, 0, 0, 1.0, 1, brightness=0.0, contrast=1.0
+    )
+    assert np.allclose(g_fast, g_slow)
