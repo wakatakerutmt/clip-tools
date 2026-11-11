@@ -429,6 +429,43 @@ def _compute_stamp_size(
     return effective_size * size_mult * sample_size * shaped_scale
 
 
+def _compute_stamp_alpha(
+    brush: BrushStyle,
+    per_stamp_alpha: float,
+    flow_mult: float,
+    stroke_op: float,
+) -> float:
+    """Final per-stamp opacity applied inside the rasterizer's draw loop.
+
+    Factors:
+    - ``per_stamp_alpha``: stroke-level base opacity after ``flow_base``,
+      ``stroke_op``-independent hardness normalization, etc.
+    - ``flow_mult``: per-sample flow-effector output or the ``lock_flow``
+      override value.
+    - ``stroke_op``: the stroke's overall opacity.
+
+    When the brush carries a paper-grain texture
+    (``brush.texture_pattern > 0``), CSP additionally attenuates every
+    stamp by ``brush.texture_density_base``. This is the authoring-side
+    "density" control for the grain — e.g. brush 10949 stores
+    ``texture_density_base = 0.70`` for a hatching brush that lays yellow
+    paint at ~70% of its brush-level flow, and without this attenuation
+    the resulting fill reads as over-saturated mustard yellow instead of
+    CSP's pale lemon (kakidashi-kun #84 continuation, LOSS/A/2 nuri
+    +43% over-saturation vs PSD).
+
+    For brushes with ``texture_pattern == 0`` (no paper grain),
+    ``texture_density_base`` is a no-op — the field holds a default
+    1.0 in that case anyway and we skip the multiplication so brush
+    tables that happened to store a non-default value without a
+    texture_pattern can't accidentally dim the stroke.
+    """
+    alpha = per_stamp_alpha * flow_mult * stroke_op
+    if brush.texture_pattern > 0:
+        alpha *= float(brush.texture_density_base)
+    return alpha
+
+
 def _has_implicit_pressure_flow(brush: BrushStyle) -> bool:
     """Whether ``brush``'s ``FlowEffector`` encodes implicit linear
     pressure-flow modulation.
@@ -1466,7 +1503,7 @@ def render_vector_line_stamp(
             size = _compute_stamp_size(
                 brush, effective_size, size_mult, s.size, shaped_scale
             )
-            alpha = per_stamp_alpha * flow_mult * stroke_op
+            alpha = _compute_stamp_alpha(brush, per_stamp_alpha, flow_mult, stroke_op)
             # CSP's `FlowEffector` with ``flags == 0x1`` (bit 0 set, no
             # explicit pressure/velocity/smooth modulator struct) is an
             # implicit linear pressure-flow modulation. Without applying

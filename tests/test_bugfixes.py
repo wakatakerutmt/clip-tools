@@ -32,6 +32,7 @@ import pytest
 from clip_tools.api.clip_layer import ClipLayer
 from clip_tools.composite.compositor import _solid_fill_rgba
 from clip_tools.rendering import (
+    _compute_stamp_alpha,
     _compute_stamp_dimensions,
     _compute_stamp_size,
     _has_implicit_pressure_flow,
@@ -376,3 +377,69 @@ def test_stamp_size_ignores_brush_texture_scale():
     assert s_quarter == pytest.approx(s_unit)
     # And explicitly: the result must NOT be the old (buggy) scaled value.
     assert s_low != pytest.approx(10.0 * 0.25)
+
+
+# ---------------------------------------------------------------------------
+# _compute_stamp_alpha: brush.texture_density_base attenuation for textured
+# brushes (clip-tools fork #44 / kakidashi-kun #84 continuation)
+# ---------------------------------------------------------------------------
+
+
+def _mk_alpha_brush(texture_pattern, texture_density_base):
+    """Minimal BrushStyle-ish shim — the helper only reads these two fields."""
+    return types.SimpleNamespace(
+        texture_pattern=texture_pattern,
+        texture_density_base=texture_density_base,
+    )
+
+
+def test_stamp_alpha_identity_for_untextured_brush():
+    # texture_pattern == 0 (no paper grain) → density_base is a no-op.
+    brush = _mk_alpha_brush(texture_pattern=0, texture_density_base=0.5)
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(1.0)
+
+
+def test_stamp_alpha_multiplies_the_three_base_factors():
+    # The base alpha is the pure three-way product of the documented factors
+    # when the brush carries no grain.
+    brush = _mk_alpha_brush(texture_pattern=0, texture_density_base=1.0)
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=0.7, flow_mult=0.5, stroke_op=0.8
+    )
+    assert alpha == pytest.approx(0.7 * 0.5 * 0.8)
+
+
+def test_stamp_alpha_attenuates_by_texture_density_when_grain_present():
+    # kakidashi-kun #84 / clip-tools #44: brush 10949 nuri has
+    # texture_pattern=39 and texture_density_base=0.70. With grain
+    # present, every stamp must attenuate by 0.70 — without this
+    # attenuation the yellow fill reads +43% over-saturated vs PSD.
+    brush = _mk_alpha_brush(texture_pattern=39, texture_density_base=0.70)
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(0.70)
+
+
+def test_stamp_alpha_attenuation_compounds_with_other_factors():
+    brush = _mk_alpha_brush(texture_pattern=39, texture_density_base=0.70)
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=0.5, flow_mult=0.8, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(0.5 * 0.8 * 1.0 * 0.70)
+
+
+def test_stamp_alpha_density_ignored_when_pattern_is_zero_even_with_nondefault_density():
+    # Guard: if a brush table happens to store a non-1.0
+    # texture_density_base while texture_pattern is 0 (no paper grain in
+    # effect), we must NOT attenuate — doing so would dim strokes for
+    # every grain-less brush whose author left the field at some
+    # arbitrary stored value.
+    brush = _mk_alpha_brush(texture_pattern=0, texture_density_base=0.3)
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(1.0)
