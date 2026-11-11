@@ -429,6 +429,97 @@ def _compute_stamp_size(
     return effective_size * size_mult * sample_size * shaped_scale
 
 
+def _compute_stamp_alpha(
+    brush: BrushStyle,
+    per_stamp_alpha: float,
+    flow_mult: float,
+    stroke_op: float,
+) -> float:
+    """Final per-stamp opacity applied inside the rasterizer's draw loop.
+
+    Factors:
+    - ``per_stamp_alpha``: stroke-level base opacity after ``flow_base``,
+      ``stroke_op``-independent hardness normalization, etc.
+    - ``flow_mult``: per-sample flow-effector output or the ``lock_flow``
+      override value.
+    - ``stroke_op``: the stroke's overall opacity.
+
+    When a *shaped/pattern-based* brush (``pattern_style > 0``) carries a
+    paper-grain texture (``texture_pattern > 0``), CSP additionally
+    attenuates every stamp by ``brush.texture_density_base``. This is the
+    authoring-side "density" control for the grain — e.g. brush 10949
+    stores ``texture_density_base = 0.70`` for a hatching brush that lays
+    yellow paint at ~70% of its brush-level flow, and without this
+    attenuation the resulting fill reads as over-saturated mustard
+    yellow instead of CSP's pale lemon (kakidashi-kun #84 continuation,
+    LOSS/A/2 nuri +43% over-saturation vs PSD).
+
+    For a *standard pen* (``pattern_style == 0``) ``texture_density_base``
+    does NOT act as a flat per-stamp attenuation, even when
+    ``texture_pattern > 0``. CSP applies the paper grain to standard
+    pens through its per-pixel texture modulation pipeline (not
+    implemented here yet), and treating ``texture_density_base`` as a
+    stamp-wide multiplier collapses the stroke: brush 10948 (Y4 LOSS
+    sen) ships ``texture_density_base = 0.26``, and multiplying every
+    stamp by 0.26 reduced the sen silhouette to a faint ghost line that
+    is visibly thinner / paler than PSD. The user caught this regression
+    on the LOSS/A/2 line in the v4 visual review, so standard pens stay
+    at full per-stamp alpha until proper paper-grain modulation lands.
+
+    For brushes with ``texture_pattern == 0`` (no paper grain),
+    ``texture_density_base`` is a no-op — the field holds a default
+    1.0 in that case anyway and we skip the multiplication so brush
+    tables that happened to store a non-default value without a
+    texture_pattern can't accidentally dim the stroke.
+    """
+    alpha = per_stamp_alpha * flow_mult * stroke_op
+    if brush.texture_pattern > 0 and brush.pattern_style > 0:
+        alpha *= float(brush.texture_density_base)
+    return alpha
+
+
+def _sample_paper_grain_patch(
+    texture: np.ndarray,
+    bbox_h: int,
+    bbox_w: int,
+    bbox_x0_ss: int,
+    bbox_y0_ss: int,
+    texture_scale: float,
+    ss: int,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+) -> np.ndarray:
+    """Sample a paper-grain texture at canvas coordinates for a stroke bbox.
+
+    Returns a ``(bbox_h, bbox_w)`` float32 array in ``[0, 1]``: the
+    per-pixel multiplier to apply to the stroke's alpha plane before
+    compositing. Mirrors the spray path's grain sampling at ~L1263 but
+    operates on a stroke-local bbox (so vector-heavy files do not pay
+    for the full-canvas grain each stroke).
+
+    The tile is addressed in **absolute canvas ss coords** (not bbox-
+    local), so the grain pattern stays aligned across overlapping
+    strokes exactly as CSP does — two neighbouring strokes see the
+    same grain where they share pixels.
+
+    Brightness / contrast are preprocessed as
+    ``t' = clip((t - 0.5) * contrast + 0.5 + brightness, 0, 1)``
+    to match the spray path (and the CSP brush authoring UI's
+    TextureBrightness / TextureContrast sliders). Both default to
+    identity when the brush has no explicit values.
+    """
+    th, tw = texture.shape
+    scale = max(0.001, texture_scale)
+    ys = np.arange(bbox_y0_ss, bbox_y0_ss + bbox_h)
+    xs = np.arange(bbox_x0_ss, bbox_x0_ss + bbox_w)
+    v_idx = (ys / (ss * scale)).astype(np.int32) % th
+    u_idx = (xs / (ss * scale)).astype(np.int32) % tw
+    grain = texture[v_idx[:, None], u_idx[None, :]].astype(np.float32) / 255.0
+    if brightness != 0.0 or contrast != 1.0:
+        grain = np.clip((grain - 0.5) * contrast + 0.5 + brightness, 0.0, 1.0)
+    return grain
+
+
 def _has_implicit_pressure_flow(brush: BrushStyle) -> bool:
     """Whether ``brush``'s ``FlowEffector`` encodes implicit linear
     pressure-flow modulation.
@@ -485,6 +576,42 @@ def composite_alpha_onto(
             (color[ch] / 255.0) * stroke_alpha
             + buffer[..., ch] * dst_a * (1.0 - stroke_alpha)
         ) / safe_a
+    buffer[..., 3] = out_a
+
+
+def multiply_alpha_onto(
+    buffer: np.ndarray,
+    stroke_alpha: np.ndarray,
+    color: Tuple[int, int, int],
+) -> None:
+    """MULTIPLY-composite a solid-color stroke onto the RGBA buffer.
+
+    Mirror of :func:`composite_alpha_onto` for ``brush.composite_mode == 2``
+    (CSP's MULTIPLY). The stroke darkens the underlying buffer by the
+    stroke color where the stroke covers, weighted by the stroke's alpha
+    mask. In contrast to OVER (which replaces dst with src where the
+    stroke is opaque), MULTIPLY keeps the dst showing through — just
+    darkened — which is how sen ink layers in CSP preserve the paper
+    color behind them.
+
+    Per-channel formula (standard CSP MULTIPLY, alpha-weighted):
+        out_rgb = dst_rgb * ((1 - a_s) + a_s * src_rgb)
+                = dst_rgb * (1 - a_s * (1 - src_rgb))
+    Alpha composition stays source-over because the stroke's silhouette
+    is unchanged — only its colorimetric effect switches.
+
+    No native fast path yet; the OVER fast path (:data:`
+    _composite_alpha_onto_fast`) hard-codes the OVER formula and does
+    not take a composite mode. The per-stroke numpy path is small
+    relative to the stamp loop, and MULTIPLY brushes are a minority of
+    strokes in real files.
+    """
+    a_s = stroke_alpha
+    dst_a = buffer[..., 3]
+    out_a = a_s + dst_a * (1.0 - a_s)
+    for ch in range(3):
+        src = color[ch] / 255.0
+        buffer[..., ch] = buffer[..., ch] * (1.0 - a_s * (1.0 - src))
     buffer[..., 3] = out_a
 
 
@@ -1466,7 +1593,7 @@ def render_vector_line_stamp(
             size = _compute_stamp_size(
                 brush, effective_size, size_mult, s.size, shaped_scale
             )
-            alpha = per_stamp_alpha * flow_mult * stroke_op
+            alpha = _compute_stamp_alpha(brush, per_stamp_alpha, flow_mult, stroke_op)
             # CSP's `FlowEffector` with ``flags == 0x1`` (bit 0 set, no
             # explicit pressure/velocity/smooth modulator struct) is an
             # implicit linear pressure-flow modulation. Without applying
@@ -1580,8 +1707,47 @@ def render_vector_line_stamp(
         if use_analytic_disc and stroke_alpha is not None:
             sx0, sy0 = stroke_alpha_origin
             sh, sw = stroke_alpha.shape
+            # Apply the brush's paper-grain texture per-pixel to the
+            # stroke alpha plane BEFORE compositing. This is the
+            # orthogonal axis to ``brush.texture_density_base`` (per-
+            # stamp scalar for shaped brushes, applied in
+            # ``_compute_stamp_alpha``): the grain modulates per-pixel
+            # coverage via the brush's paper pattern, driving nuri /
+            # soft-pen alpha down to CSP-matching levels. Mirrors the
+            # spray path's grain application at ~L1300.
+            if brush.texture_pattern and brush.texture_pattern in pattern_images:
+                tex = pattern_images[brush.texture_pattern]
+                bright = (
+                    brush.texture_brightness
+                    if hasattr(brush, "texture_brightness")
+                    else 0.0
+                )
+                contrast = (
+                    brush.texture_contrast
+                    if hasattr(brush, "texture_contrast")
+                    else 1.0
+                )
+                grain = _sample_paper_grain_patch(
+                    tex,
+                    sh,
+                    sw,
+                    sx0,
+                    sy0,
+                    brush.texture_scale,
+                    ss,
+                    brightness=bright,
+                    contrast=contrast,
+                )
+                stroke_alpha *= grain
             buf_region = buf[sy0 : sy0 + sh, sx0 : sx0 + sw]
-            composite_alpha_onto(buf_region, stroke_alpha, color)
+            # ``brush.composite_mode`` selects the per-stroke blend
+            # formula. CSP exposes a dozen+ modes; so far only Normal (0)
+            # and Multiply (2) are observed on sen/nuri brushes in the
+            # fixture set, and only Multiply changes behavior from OVER.
+            if brush.composite_mode == 2:
+                multiply_alpha_onto(buf_region, stroke_alpha, color)
+            else:
+                composite_alpha_onto(buf_region, stroke_alpha, color)
 
     # Finalize the raster. For a vector-heavy file whose strokes only cover
     # a small region of the canvas, the full-canvas ss-reduce and uint8

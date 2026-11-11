@@ -32,10 +32,15 @@ import pytest
 from clip_tools.api.clip_layer import ClipLayer
 from clip_tools.composite.compositor import _solid_fill_rgba
 from clip_tools.rendering import (
+    _compute_stamp_alpha,
     _compute_stamp_dimensions,
     _compute_stamp_size,
     _has_implicit_pressure_flow,
+    _sample_paper_grain_patch,
+    composite_alpha_onto,
+    multiply_alpha_onto,
 )
+import numpy as np
 from clip_tools.structs.blob_parsers import (
     BrushEffector,
     EffectorPressure,
@@ -376,3 +381,264 @@ def test_stamp_size_ignores_brush_texture_scale():
     assert s_quarter == pytest.approx(s_unit)
     # And explicitly: the result must NOT be the old (buggy) scaled value.
     assert s_low != pytest.approx(10.0 * 0.25)
+
+
+# ---------------------------------------------------------------------------
+# _compute_stamp_alpha: brush.texture_density_base attenuation for textured
+# brushes (clip-tools fork #44 / kakidashi-kun #84 continuation)
+# ---------------------------------------------------------------------------
+
+
+def _mk_alpha_brush(texture_pattern, texture_density_base, pattern_style=16):
+    """Minimal BrushStyle-ish shim — the helper reads these three fields.
+
+    ``pattern_style`` defaults to a shaped value so the tests that care only
+    about ``texture_pattern`` + ``texture_density_base`` behavior don't have
+    to pass it explicitly. Use ``pattern_style=0`` to simulate a standard
+    pen (where density_base is intentionally ignored even with grain).
+    """
+    return types.SimpleNamespace(
+        texture_pattern=texture_pattern,
+        texture_density_base=texture_density_base,
+        pattern_style=pattern_style,
+    )
+
+
+def test_stamp_alpha_identity_for_untextured_brush():
+    # texture_pattern == 0 (no paper grain) → density_base is a no-op.
+    brush = _mk_alpha_brush(texture_pattern=0, texture_density_base=0.5)
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(1.0)
+
+
+def test_stamp_alpha_multiplies_the_three_base_factors():
+    # The base alpha is the pure three-way product of the documented factors
+    # when the brush carries no grain.
+    brush = _mk_alpha_brush(texture_pattern=0, texture_density_base=1.0)
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=0.7, flow_mult=0.5, stroke_op=0.8
+    )
+    assert alpha == pytest.approx(0.7 * 0.5 * 0.8)
+
+
+def test_stamp_alpha_attenuates_by_texture_density_when_grain_present_on_shaped_brush():
+    # kakidashi-kun #84 / clip-tools #44: brush 10949 nuri is a shaped
+    # brush (pattern_style=16) with texture_pattern=39 and
+    # texture_density_base=0.70. With grain present on a shaped brush,
+    # every stamp must attenuate by 0.70 — without this attenuation the
+    # yellow fill reads +43% over-saturated vs PSD.
+    brush = _mk_alpha_brush(
+        texture_pattern=39, texture_density_base=0.70, pattern_style=16
+    )
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(0.70)
+
+
+def test_stamp_alpha_density_ignored_for_standard_pen_even_with_grain():
+    # kakidashi-kun #84 / clip-tools #44 v4 visual review: brush 10948
+    # (Y4 LOSS sen) is a standard pen (pattern_style=0) that also
+    # carries a paper grain (texture_pattern=40) and stores
+    # texture_density_base=0.26. If every stamp were multiplied by 0.26
+    # the rendered sen line turns into a faint ghost — the user caught
+    # this regression on the LOSS/A/2 visual check. Standard pens must
+    # NOT attenuate by density_base; CSP routes their paper-grain
+    # response through per-pixel texture modulation (not implemented
+    # here yet), not a stamp-wide multiplier.
+    brush = _mk_alpha_brush(
+        texture_pattern=40, texture_density_base=0.26, pattern_style=0
+    )
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(1.0)
+
+
+def test_stamp_alpha_attenuation_compounds_with_other_factors():
+    brush = _mk_alpha_brush(
+        texture_pattern=39, texture_density_base=0.70, pattern_style=16
+    )
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=0.5, flow_mult=0.8, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(0.5 * 0.8 * 1.0 * 0.70)
+
+
+def test_stamp_alpha_density_ignored_when_pattern_is_zero_even_with_nondefault_density():
+    # Guard: if a brush table happens to store a non-1.0
+    # texture_density_base while texture_pattern is 0 (no paper grain in
+    # effect), we must NOT attenuate — doing so would dim strokes for
+    # every grain-less brush whose author left the field at some
+    # arbitrary stored value.
+    brush = _mk_alpha_brush(texture_pattern=0, texture_density_base=0.3)
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# multiply_alpha_onto: per-stroke MULTIPLY composite for composite_mode=2
+# (clip-tools fork #44, LOSA/A2 sen over-darkness)
+# ---------------------------------------------------------------------------
+
+
+def _mk_rgba(h, w, r, g, b, a):
+    buf = np.zeros((h, w, 4), dtype=np.float32)
+    buf[..., 0] = r
+    buf[..., 1] = g
+    buf[..., 2] = b
+    buf[..., 3] = a
+    return buf
+
+
+def test_multiply_alpha_onto_full_cover_dark_src_darkens_bright_dst():
+    # Full-opacity MULTIPLY of dark (0.1,0.1,0.1) onto bright (1.0,1.0,1.0)
+    # gives the dark color (equivalent to replacing when alpha=1 and dst=white).
+    buf = _mk_rgba(1, 1, 1.0, 1.0, 1.0, 1.0)
+    stroke_alpha = np.ones((1, 1), dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (26, 26, 26))  # 0.102 normalized
+    assert buf[0, 0, 0] == pytest.approx(26 / 255.0, abs=1e-3)
+    assert buf[0, 0, 1] == pytest.approx(26 / 255.0, abs=1e-3)
+    assert buf[0, 0, 2] == pytest.approx(26 / 255.0, abs=1e-3)
+
+
+def test_multiply_alpha_onto_zero_alpha_is_identity():
+    # With stroke_alpha=0, the buffer must be unchanged — any color.
+    buf = _mk_rgba(1, 1, 0.5, 0.6, 0.7, 1.0)
+    stroke_alpha = np.zeros((1, 1), dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (0, 0, 0))
+    assert buf[0, 0, 0] == pytest.approx(0.5)
+    assert buf[0, 0, 1] == pytest.approx(0.6)
+    assert buf[0, 0, 2] == pytest.approx(0.7)
+
+
+def test_multiply_alpha_onto_half_cover_half_darkens():
+    # Half-opacity MULTIPLY of half-brightness onto bright dst:
+    # out = dst * (1 - 0.5 * (1 - 0.5)) = 1.0 * 0.75 = 0.75
+    buf = _mk_rgba(1, 1, 1.0, 1.0, 1.0, 1.0)
+    stroke_alpha = np.full((1, 1), 0.5, dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (128, 128, 128))  # 0.502 normalized
+    expected = 1.0 * (1.0 - 0.5 * (1.0 - 128 / 255.0))
+    assert buf[0, 0, 0] == pytest.approx(expected, abs=1e-3)
+
+
+def test_multiply_alpha_onto_two_overlapping_strokes_darken_multiplicatively():
+    # MULTIPLY is a repeated per-channel scaling — overlapping strokes
+    # compound the darkening factor, they do NOT saturate alpha toward 1
+    # the way OVER accumulation does. Two half-opacity passes of a mid
+    # dark color (0.251) on bright dst (1.0) each apply the scale factor
+    # (1 - 0.5 * (1 - 0.251)) = 0.625, so the result is exactly the
+    # product 0.625^2.
+    buf = _mk_rgba(1, 1, 1.0, 1.0, 1.0, 1.0)
+    stroke_alpha = np.full((1, 1), 0.5, dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (64, 64, 64))
+    v1 = float(buf[0, 0, 0])
+    multiply_alpha_onto(buf, stroke_alpha, (64, 64, 64))
+    v2 = float(buf[0, 0, 0])
+    scale = 1.0 - 0.5 * (1.0 - 64 / 255.0)
+    assert v1 == pytest.approx(scale, abs=1e-3)
+    assert v2 == pytest.approx(scale * scale, abs=1e-3)
+    assert v2 < v1  # each extra pass darkens further
+
+
+def test_multiply_alpha_onto_alpha_channel_follows_source_over():
+    # The alpha channel composition is unchanged by MULTIPLY — the stroke
+    # silhouette still covers the dst using source-over.
+    buf = _mk_rgba(1, 1, 1.0, 1.0, 1.0, 0.5)
+    stroke_alpha = np.full((1, 1), 0.3, dtype=np.float32)
+    multiply_alpha_onto(buf, stroke_alpha, (100, 100, 100))
+    expected_a = 0.3 + 0.5 * (1.0 - 0.3)
+    assert buf[0, 0, 3] == pytest.approx(expected_a)
+
+
+# ---------------------------------------------------------------------------
+# _sample_paper_grain_patch: per-pixel paper-grain modulation for line_stamp
+# path (clip-tools fork #44 Phase 2, kakidashi-kun #84 continuation)
+# ---------------------------------------------------------------------------
+
+
+def test_sample_paper_grain_patch_returns_unit_interval_floats():
+    # A uniform 128-value grain tile sampled anywhere must come back as
+    # 128/255 ≈ 0.502 (no brightness/contrast adjustment).
+    tex = np.full((8, 8), 128, dtype=np.uint8)
+    grain = _sample_paper_grain_patch(
+        tex,
+        bbox_h=4,
+        bbox_w=4,
+        bbox_x0_ss=0,
+        bbox_y0_ss=0,
+        texture_scale=1.0,
+        ss=1,
+    )
+    assert grain.shape == (4, 4)
+    assert grain.dtype == np.float32
+    assert float(grain.min()) == pytest.approx(128 / 255.0, abs=1e-5)
+    assert float(grain.max()) == pytest.approx(128 / 255.0, abs=1e-5)
+
+
+def test_sample_paper_grain_patch_wraps_with_absolute_canvas_origin():
+    # The sampler must address the tile in ABSOLUTE canvas ss coords so
+    # two neighbouring strokes see the same grain where their bboxes
+    # overlap. Create a 2×2 tile with a known pattern, then sample two
+    # 1×1 patches at adjacent ss coords and assert they pick up the
+    # right tile cells.
+    tex = np.array([[10, 200], [50, 150]], dtype=np.uint8)
+    # Patch at (0, 0) → tile cell (0, 0) → 10/255
+    g0 = _sample_paper_grain_patch(tex, 1, 1, 0, 0, 1.0, 1)
+    assert float(g0[0, 0]) == pytest.approx(10 / 255.0)
+    # Patch at (1, 0) → tile cell (0, 1) → 200/255
+    g1 = _sample_paper_grain_patch(tex, 1, 1, 1, 0, 1.0, 1)
+    assert float(g1[0, 0]) == pytest.approx(200 / 255.0)
+    # Patch at (0, 3) wraps → tile cell (1, 0) (3 % 2 = 1) → 50/255
+    g2 = _sample_paper_grain_patch(tex, 1, 1, 0, 3, 1.0, 1)
+    assert float(g2[0, 0]) == pytest.approx(50 / 255.0)
+
+
+def test_sample_paper_grain_patch_scales_tile_by_texture_scale_and_ss():
+    # Tile scale controls the tiling period. A 2×2 tile with
+    # texture_scale=0.5 at ss=2 means each tile cell spans
+    # (ss * scale) = 1 ss-pixel. At ss=4, same tex_scale → 2 ss-pixels
+    # per cell. Sample a 1-wide patch straddling the boundary.
+    tex = np.array([[10, 200], [50, 150]], dtype=np.uint8)
+    # scale=0.5, ss=2 → divisor (ss*scale)=1.0 → each cell = 1 ss-px.
+    # Patches at ss x=0 and x=1 must pick cells (0,0) and (0,1).
+    g0 = _sample_paper_grain_patch(tex, 1, 1, 0, 0, 0.5, 2)
+    g1 = _sample_paper_grain_patch(tex, 1, 1, 1, 0, 0.5, 2)
+    assert float(g0[0, 0]) == pytest.approx(10 / 255.0)
+    assert float(g1[0, 0]) == pytest.approx(200 / 255.0)
+
+
+def test_sample_paper_grain_patch_applies_brightness_and_contrast():
+    # Brightness/contrast curve: t' = clip((t - 0.5) * c + 0.5 + b, 0, 1)
+    # A uniform 128 tile → t = 0.502. With contrast=2, brightness=0:
+    #   t' = clip((0.502 - 0.5) * 2 + 0.5, 0, 1) ≈ 0.504
+    # With brightness=0.5:
+    #   t' = clip(0.502 - 0.5 + 0.5 + 0.5, 0, 1) = 1.0 (clipped)
+    tex = np.full((4, 4), 128, dtype=np.uint8)
+    g_contrast = _sample_paper_grain_patch(
+        tex, 1, 1, 0, 0, 1.0, 1, brightness=0.0, contrast=2.0
+    )
+    assert float(g_contrast[0, 0]) == pytest.approx(
+        np.clip((128 / 255.0 - 0.5) * 2.0 + 0.5, 0.0, 1.0), abs=1e-5
+    )
+    g_bright_clipped = _sample_paper_grain_patch(
+        tex, 1, 1, 0, 0, 1.0, 1, brightness=0.5, contrast=1.0
+    )
+    assert float(g_bright_clipped[0, 0]) == pytest.approx(1.0)
+
+
+def test_sample_paper_grain_patch_identity_bc_leaves_tile_as_is():
+    # When brightness == 0 and contrast == 1 we must take the fast path
+    # that does NOT run the clip+arithmetic (the fast path returns the
+    # raw tile sample straight from the texture). Fast-path bit-matches
+    # the slow path at b=0,c=1, verified via identical output.
+    tex = np.array([[10, 200], [50, 150]], dtype=np.uint8)
+    g_fast = _sample_paper_grain_patch(tex, 2, 2, 0, 0, 1.0, 1)
+    g_slow = _sample_paper_grain_patch(
+        tex, 2, 2, 0, 0, 1.0, 1, brightness=0.0, contrast=1.0
+    )
+    assert np.allclose(g_fast, g_slow)
