@@ -444,15 +444,27 @@ def _compute_stamp_alpha(
       override value.
     - ``stroke_op``: the stroke's overall opacity.
 
-    When the brush carries a paper-grain texture
-    (``brush.texture_pattern > 0``), CSP additionally attenuates every
-    stamp by ``brush.texture_density_base``. This is the authoring-side
-    "density" control for the grain — e.g. brush 10949 stores
-    ``texture_density_base = 0.70`` for a hatching brush that lays yellow
-    paint at ~70% of its brush-level flow, and without this attenuation
-    the resulting fill reads as over-saturated mustard yellow instead of
-    CSP's pale lemon (kakidashi-kun #84 continuation, LOSS/A/2 nuri
-    +43% over-saturation vs PSD).
+    When a *shaped/pattern-based* brush (``pattern_style > 0``) carries a
+    paper-grain texture (``texture_pattern > 0``), CSP additionally
+    attenuates every stamp by ``brush.texture_density_base``. This is the
+    authoring-side "density" control for the grain — e.g. brush 10949
+    stores ``texture_density_base = 0.70`` for a hatching brush that lays
+    yellow paint at ~70% of its brush-level flow, and without this
+    attenuation the resulting fill reads as over-saturated mustard
+    yellow instead of CSP's pale lemon (kakidashi-kun #84 continuation,
+    LOSS/A/2 nuri +43% over-saturation vs PSD).
+
+    For a *standard pen* (``pattern_style == 0``) ``texture_density_base``
+    does NOT act as a flat per-stamp attenuation, even when
+    ``texture_pattern > 0``. CSP applies the paper grain to standard
+    pens through its per-pixel texture modulation pipeline (not
+    implemented here yet), and treating ``texture_density_base`` as a
+    stamp-wide multiplier collapses the stroke: brush 10948 (Y4 LOSS
+    sen) ships ``texture_density_base = 0.26``, and multiplying every
+    stamp by 0.26 reduced the sen silhouette to a faint ghost line that
+    is visibly thinner / paler than PSD. The user caught this regression
+    on the LOSS/A/2 line in the v4 visual review, so standard pens stay
+    at full per-stamp alpha until proper paper-grain modulation lands.
 
     For brushes with ``texture_pattern == 0`` (no paper grain),
     ``texture_density_base`` is a no-op — the field holds a default
@@ -461,7 +473,7 @@ def _compute_stamp_alpha(
     texture_pattern can't accidentally dim the stroke.
     """
     alpha = per_stamp_alpha * flow_mult * stroke_op
-    if brush.texture_pattern > 0:
+    if brush.texture_pattern > 0 and brush.pattern_style > 0:
         alpha *= float(brush.texture_density_base)
     return alpha
 

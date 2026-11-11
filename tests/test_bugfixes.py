@@ -388,11 +388,18 @@ def test_stamp_size_ignores_brush_texture_scale():
 # ---------------------------------------------------------------------------
 
 
-def _mk_alpha_brush(texture_pattern, texture_density_base):
-    """Minimal BrushStyle-ish shim — the helper only reads these two fields."""
+def _mk_alpha_brush(texture_pattern, texture_density_base, pattern_style=16):
+    """Minimal BrushStyle-ish shim — the helper reads these three fields.
+
+    ``pattern_style`` defaults to a shaped value so the tests that care only
+    about ``texture_pattern`` + ``texture_density_base`` behavior don't have
+    to pass it explicitly. Use ``pattern_style=0`` to simulate a standard
+    pen (where density_base is intentionally ignored even with grain).
+    """
     return types.SimpleNamespace(
         texture_pattern=texture_pattern,
         texture_density_base=texture_density_base,
+        pattern_style=pattern_style,
     )
 
 
@@ -415,20 +422,44 @@ def test_stamp_alpha_multiplies_the_three_base_factors():
     assert alpha == pytest.approx(0.7 * 0.5 * 0.8)
 
 
-def test_stamp_alpha_attenuates_by_texture_density_when_grain_present():
-    # kakidashi-kun #84 / clip-tools #44: brush 10949 nuri has
-    # texture_pattern=39 and texture_density_base=0.70. With grain
-    # present, every stamp must attenuate by 0.70 — without this
-    # attenuation the yellow fill reads +43% over-saturated vs PSD.
-    brush = _mk_alpha_brush(texture_pattern=39, texture_density_base=0.70)
+def test_stamp_alpha_attenuates_by_texture_density_when_grain_present_on_shaped_brush():
+    # kakidashi-kun #84 / clip-tools #44: brush 10949 nuri is a shaped
+    # brush (pattern_style=16) with texture_pattern=39 and
+    # texture_density_base=0.70. With grain present on a shaped brush,
+    # every stamp must attenuate by 0.70 — without this attenuation the
+    # yellow fill reads +43% over-saturated vs PSD.
+    brush = _mk_alpha_brush(
+        texture_pattern=39, texture_density_base=0.70, pattern_style=16
+    )
     alpha = _compute_stamp_alpha(
         brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
     )
     assert alpha == pytest.approx(0.70)
 
 
+def test_stamp_alpha_density_ignored_for_standard_pen_even_with_grain():
+    # kakidashi-kun #84 / clip-tools #44 v4 visual review: brush 10948
+    # (Y4 LOSS sen) is a standard pen (pattern_style=0) that also
+    # carries a paper grain (texture_pattern=40) and stores
+    # texture_density_base=0.26. If every stamp were multiplied by 0.26
+    # the rendered sen line turns into a faint ghost — the user caught
+    # this regression on the LOSS/A/2 visual check. Standard pens must
+    # NOT attenuate by density_base; CSP routes their paper-grain
+    # response through per-pixel texture modulation (not implemented
+    # here yet), not a stamp-wide multiplier.
+    brush = _mk_alpha_brush(
+        texture_pattern=40, texture_density_base=0.26, pattern_style=0
+    )
+    alpha = _compute_stamp_alpha(
+        brush, per_stamp_alpha=1.0, flow_mult=1.0, stroke_op=1.0
+    )
+    assert alpha == pytest.approx(1.0)
+
+
 def test_stamp_alpha_attenuation_compounds_with_other_factors():
-    brush = _mk_alpha_brush(texture_pattern=39, texture_density_base=0.70)
+    brush = _mk_alpha_brush(
+        texture_pattern=39, texture_density_base=0.70, pattern_style=16
+    )
     alpha = _compute_stamp_alpha(
         brush, per_stamp_alpha=0.5, flow_mult=0.8, stroke_op=1.0
     )
