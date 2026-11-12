@@ -1822,39 +1822,35 @@ def render_vector_line_stamp(
         if ub_x1 > ub_x0 and ub_y1 > ub_y0:
             region_h = (ub_y1 - ub_y0) // ss
             region_w = (ub_x1 - ub_x0) // ss
-            if _reduce_and_cast_fast is not None:
-                # Native single-pass: sum ss×ss subpixels, divide by ss²,
-                # multiply by 256, clamp to 255, cast to uint8, write.
-                # Avoids the ``reduced`` float32 temp and the subsequent
-                # int32 cast temp (both proportional to painted-region
-                # bytes). ~2× faster than the einsum+cast pair on Y4.
-                _reduce_and_cast_fast(
-                    buf,
-                    rendered,
-                    ub_y0,
-                    ub_x0,
-                    region_h,
-                    region_w,
-                    ss,
-                    1.0 / (ss * ss),
-                )
+            # Downsample in premultiplied-alpha space. ``buf`` stores
+            # straight (un-premultiplied) RGBA. Averaging straight RGB
+            # across ss×ss tiles that include never-painted (0,0,0,0)
+            # neighbors pulls the RGB channels down toward zero — showing
+            # as a dark ring around each stroke even though the alpha
+            # channel averages correctly (kakidashi-kun #96, Y4 LOSS/A2
+            # nuri had visible black edges around every dessin-pencil
+            # stroke). Premultiplying before the reduce, then un-
+            # premultiplying after, keeps the stroke color at its painted
+            # value while the averaged alpha correctly reflects coverage.
+            #
+            # The Cython ``_reduce_and_cast_fast`` fast path hard-codes
+            # the straight-space average and is skipped here; porting it
+            # to premult-aware math is a follow-up (see #47).
+            if ss > 1:
+                tile = buf[ub_y0:ub_y1, ub_x0:ub_x1].astype(np.float32, copy=True)
+                alpha = tile[..., 3:4]
+                tile[..., :3] = tile[..., :3] * alpha  # straight -> premult
+                tiled = tile.reshape(region_h, ss, region_w, ss, 4)
+                reduced = np.einsum("hswSc->hwc", tiled) * (1.0 / (ss * ss))
+                safe_a = np.where(reduced[..., 3:4] > 1e-6, reduced[..., 3:4], 1.0)
+                reduced[..., :3] = reduced[..., :3] / safe_a  # premult -> straight
             else:
-                if ss > 1:
-                    # ``einsum`` with an explicit sum-and-divide beats
-                    # ``.mean(axis=(1,3))`` by ~25% on a Y4-sized buffer
-                    # (578 ms vs 775 ms for 1227 MB float32), and is bit-exact
-                    # against the one-shot ``.sum(axis=(1,3)) / ss²`` baseline.
-                    tiled = buf[ub_y0:ub_y1, ub_x0:ub_x1].reshape(
-                        region_h, ss, region_w, ss, 4
-                    )
-                    reduced = np.einsum("hswSc->hwc", tiled) * (1.0 / (ss * ss))
-                else:
-                    reduced = buf[ub_y0:ub_y1, ub_x0:ub_x1]
-                # Final uint8 cast on just the painted region.
-                rendered[
-                    ub_y0 // ss : ub_y0 // ss + region_h,
-                    ub_x0 // ss : ub_x0 // ss + region_w,
-                ] = np.minimum(255, (reduced * 256).astype(np.int32)).astype(np.uint8)
+                reduced = buf[ub_y0:ub_y1, ub_x0:ub_x1]
+            # CLIP's coverage→alpha conversion is ``min(255, floor(alpha * 256))``.
+            rendered[
+                ub_y0 // ss : ub_y0 // ss + region_h,
+                ub_x0 // ss : ub_x0 // ss + region_w,
+            ] = np.minimum(255, (reduced * 256).astype(np.int32)).astype(np.uint8)
     return rendered, skipped
 
 

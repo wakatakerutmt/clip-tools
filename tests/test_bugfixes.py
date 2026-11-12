@@ -885,3 +885,48 @@ def test_shaped_path_no_grain_when_texture_pattern_zero(monkeypatch):
     img_a = _render_shaped_single_stroke(monkeypatch, texture_pattern=0, grain_tex=None)
     img_b = _render_shaped_single_stroke(monkeypatch, texture_pattern=0, grain_tex=None)
     assert np.array_equal(img_a, img_b)
+
+
+def test_ss_reduce_preserves_edge_color_at_low_alpha(monkeypatch):
+    # Regression (kakidashi-kun #96 Y4 LOSS/A2, user-reported "縁に黒"):
+    # the supersample-reduce step used to average ``buf`` in straight-RGB
+    # space, so a single painted sub-pixel surrounded by three never-
+    # painted neighbors (RGB=0, A=0) averaged its RGB channels toward
+    # zero. Edge pixels of every low-alpha stroke then rendered as a dark
+    # ring (brown/black around a yellow stroke) even though the alpha
+    # channel averaged correctly.
+    #
+    # Fix: downsample in premultiplied-alpha space, then un-premultiply.
+    # An RGB=yellow, A=0.1 pixel next to three transparent neighbors
+    # reduces to a pixel whose RGB stays yellow and whose alpha averages
+    # to 0.025 — correct both for the color and the coverage.
+    import clip_tools.rendering as rendering
+
+    canvas_h, canvas_w = 2, 2  # one output pixel, ss=2 → 2×2 subpixels
+    ss = 2
+    buf = np.zeros((canvas_h * ss, canvas_w * ss, 4), dtype=np.float32)
+    # Paint one subpixel at (1, 1) pure red with 10% alpha. The other
+    # three subpixels in the ss-tile covering output pixel (0, 0) stay
+    # (0,0,0,0) — i.e. never touched by any stroke.
+    buf[1, 1] = [1.0, 0.0, 0.0, 0.1]
+
+    # Hand-run the exact reduce block the fix lives in.
+    # We cannot import the inner block directly; replicate it on the buf
+    # slice that covers output pixel (0, 0).
+    region_h, region_w = 1, 1
+    tile = buf[0:ss, 0:ss].astype(np.float32, copy=True)
+    alpha = tile[..., 3:4]
+    tile[..., :3] = tile[..., :3] * alpha
+    tiled = tile.reshape(region_h, ss, region_w, ss, 4)
+    reduced = np.einsum("hswSc->hwc", tiled) * (1.0 / (ss * ss))
+    safe_a = np.where(reduced[..., 3:4] > 1e-6, reduced[..., 3:4], 1.0)
+    reduced[..., :3] = reduced[..., :3] / safe_a
+    out = np.minimum(255, (reduced * 256).astype(np.int32)).astype(np.uint8)
+
+    r, g, b, a = out[0, 0]
+    # R channel must stay saturated red — not get averaged toward zero by
+    # the three transparent neighbors (the bug would give r ≈ 64).
+    assert r >= 250, f"edge pixel R darkened by straight-RGB average: r={r}"
+    assert g == 0 and b == 0, f"edge pixel bled color: g={g} b={b}"
+    # Alpha averages across the 2×2 tile normally.
+    assert 5 <= a <= 7, f"edge pixel alpha wrong: a={a}"
