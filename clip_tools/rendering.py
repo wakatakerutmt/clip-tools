@@ -1430,6 +1430,19 @@ def render_vector_line_stamp(
             )
             continue
 
+        # CompositeMode 27 is CSP's "Erase" brush — it reduces dst alpha
+        # by the stamp's src alpha without laying down any color. Our
+        # renderer has no destination-out path yet; without this guard
+        # the brush falls through to standard OVER and paints its
+        # authoring color (typically a dark gray — brush 10951 in the
+        # Y4 LOSS/A2 nuri layer uses (43, 52, 51) with hardness=0.01)
+        # as a visible mark that CSP's own output never shows. Skipping
+        # matches CSP's behavior on a layer with nothing to erase; on a
+        # layer with paint beneath the stroke, a proper destination-out
+        # implementation still needs to land as a follow-up.
+        if brush.composite_mode == 27:
+            continue
+
         tex_mask: Optional[np.ndarray] = None
         if brush.pattern_style > 0:
             for iid in get_pattern_style_images(dfs, brush.pattern_style):

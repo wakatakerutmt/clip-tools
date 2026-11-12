@@ -887,6 +887,41 @@ def test_shaped_path_no_grain_when_texture_pattern_zero(monkeypatch):
     assert np.array_equal(img_a, img_b)
 
 
+def test_erase_brush_composite_mode_27_is_skipped(monkeypatch):
+    # Regression (kakidashi-kun #96 Y4 LOSS/A2 nuri 眼下の黒):
+    # CSP's CompositeMode 27 is the "Erase" brush — it reduces dst alpha
+    # by the stamp's src alpha without laying down any color. Our
+    # renderer has no destination-out path, so without a guard the brush
+    # falls through to standard OVER and paints its authoring color
+    # (brush 10951 in Y4 LOSS/A2 nuri uses (43, 52, 51) with very low
+    # hardness) as a visible dark mark CSP's own output never shows.
+    #
+    # Fix: skip rendering CompositeMode == 27 strokes entirely. On a
+    # layer with nothing to erase this matches CSP's behavior; a proper
+    # destination-out implementation is a follow-up for the case where
+    # the layer has paint beneath the stroke.
+    import clip_tools.rendering as rendering
+
+    erase_brush = _mk_shaped_brush(texture_pattern=0)
+    # Override to be a standard disc pen with CSP's Erase mode.
+    erase_brush.pattern_style = 0
+    erase_brush.composite_mode = 27
+    erase_brush.hardness = 0.01
+    monkeypatch.setattr(rendering, "default_brush", lambda _bid: erase_brush)
+    stroke = _mk_single_stamp_stroke(brush_size=8.0)
+    # The stroke's color is (200, 100, 50) — a very visible warm tone.
+    # Without the mode-27 guard this would paint that color onto the
+    # empty canvas as a dark orange mark.
+    rendered, skipped = rendering.render_vector_line_stamp(
+        [stroke], (60, 100), None, {}, {}
+    )
+    assert not skipped
+    assert rendered.shape == (60, 100, 4)
+    assert rendered[..., 3].max() == 0, (
+        f"erase brush left visible paint: max alpha = {rendered[..., 3].max()}"
+    )
+
+
 def test_ss_reduce_preserves_edge_color_at_low_alpha(monkeypatch):
     # Regression (kakidashi-kun #96 Y4 LOSS/A2, user-reported "縁に黒"):
     # the supersample-reduce step used to average ``buf`` in straight-RGB
