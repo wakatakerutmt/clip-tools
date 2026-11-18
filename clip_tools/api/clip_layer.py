@@ -312,6 +312,26 @@ class ClipLayer:
                         meta.text_layer_attributes
                     )
 
+                # When CSP stored this text layer's raster in "offscreen"
+                # format (raster is larger than canvas), the text pixels are
+                # already baked into the raster at absolute canvas coordinates.
+                # Issue #51: in that case the raster must be placed at
+                # canvas offset (0, 0) — the stored meta.layer_offset_x and
+                # attr_ds.general_offset_x describe where the text SITS WITHIN
+                # the raster, not where to place the raster on the canvas.
+                entry = self._raster.get(self.layer_id)
+                raster_is_offscreen = (
+                    entry is not None
+                    and entry.type in ("raster", "vector")
+                    and entry.image is not None
+                    and (
+                        entry.image.shape[0] > self._canvas_size[0]
+                        or entry.image.shape[1] > self._canvas_size[1]
+                    )
+                )
+                if raster_is_offscreen:
+                    return (0, 0, 0, 0)
+
                 attr_ds = self._text_attrs
                 layer_offset_x = meta.layer_offset_x + attr_ds.general_offset_x
                 layer_offset_y = meta.layer_offset_y + attr_ds.general_offset_y
