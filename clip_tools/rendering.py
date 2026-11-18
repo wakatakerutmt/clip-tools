@@ -36,6 +36,22 @@ from clip_tools.types import BrushStyle, VectorPoint, VectorSample, VectorStroke
 
 logger = logging.getLogger(__name__)
 
+# ---- Shaped-brush density model (see Issue #49) --------------------------
+# ``stamp_pattern`` uses an α-capped silhouette model instead of plain OVER:
+# at every pixel whose incoming stamp alpha exceeds ``STAMP_PAINT_THRESHOLD``
+# the destination is replaced with the brush color and the destination alpha
+# is raised to at least ``STAMP_ALPHA_CAP``. This matches CSP native output
+# for shaped brushes (e.g. dessin pencil, brush id 10949) that produce flat
+# amber nuri on a MULTIPLY paper backdrop; a straight porter-duff OVER
+# under-paints because per-stamp alpha never saturates when many soft stamps
+# are stacked.
+#
+# Threshold ``0.1`` is tuned to the dessin-pencil family: ``0.02`` was too
+# permissive (amber spread ~11× the GT area, see v8), ``0.1`` reproduces the
+# GT silhouette. Cap ``1.0`` collapses the stack to a single flat layer.
+STAMP_PAINT_THRESHOLD = 0.1
+STAMP_ALPHA_CAP = 1.0
+
 # Shared per-worker context for ProcessPoolExecutor. Populated once by
 # ``_rasterize_vectors_worker_init``, consumed by ``_rasterize_one``. Keeping
 # ``brush_styles`` / ``pattern_images`` / ``dfs`` in globals avoids pickling
@@ -720,7 +736,7 @@ def stamp_pattern(
     grain: Optional[np.ndarray] = None,
     grain_origin: Tuple[int, int] = (0, 0),
 ) -> None:
-    """Over-composite a rotated-and-scaled grayscale mask onto an RGBA float buffer.
+    """Paint an α-capped silhouette of a rotated-and-scaled grayscale mask into an RGBA float buffer.
 
     ``size_x`` and ``size_y`` are the stamp's destination footprint in pixels
     *before* rotation. The texture is scaled non-uniformly so that its
@@ -742,6 +758,13 @@ def stamp_pattern(
     re-sampling, and two strokes whose bboxes overlap still see the same
     grain where they share pixels because each one re-sampled the tile at
     the same absolute canvas coords.
+
+    Compositing uses the shaped-brush density model (see module-level
+    ``STAMP_PAINT_THRESHOLD`` / ``STAMP_ALPHA_CAP`` and Issue #49): pixels
+    whose per-stamp alpha exceeds the threshold are replaced with the brush
+    color and their destination alpha is raised to the cap, so stacked soft
+    stamps collapse to a flat silhouette the way CSP's dessin pencil does
+    instead of staying translucent under a straight porter-duff OVER.
     """
     if size_x < 1.0 or size_y < 1.0:
         return
@@ -779,15 +802,13 @@ def stamp_pattern(
         if gx0 >= 0 and gy0 >= 0 and gx0 + bw <= gw and gy0 + bh <= gh:
             src_a = src_a * grain[gy0 : gy0 + bh, gx0 : gx0 + bw]
 
+    mask = src_a > STAMP_PAINT_THRESHOLD
+    if not mask.any():
+        return
     dst = buffer[dy0:dy1, dx0:dx1]
-    dst_a = dst[..., 3]
-    out_a = src_a + dst_a * (1.0 - src_a)
-    safe_a = np.where(out_a > 1e-6, out_a, 1.0)
     for ch in range(3):
-        dst[..., ch] = (
-            (color[ch] / 255.0) * src_a + dst[..., ch] * dst_a * (1.0 - src_a)
-        ) / safe_a
-    dst[..., 3] = out_a
+        dst[..., ch] = np.where(mask, color[ch] / 255.0, dst[..., ch])
+    dst[..., 3] = np.where(mask, np.maximum(dst[..., 3], STAMP_ALPHA_CAP), dst[..., 3])
 
 
 # -----------------------------------------------------------------------------

@@ -32,6 +32,8 @@ import pytest
 from clip_tools.api.clip_layer import ClipLayer
 from clip_tools.composite.compositor import _solid_fill_rgba
 from clip_tools.rendering import (
+    STAMP_ALPHA_CAP,
+    STAMP_PAINT_THRESHOLD,
     _compute_stamp_alpha,
     _compute_stamp_dimensions,
     _compute_stamp_size,
@@ -646,100 +648,131 @@ def test_sample_paper_grain_patch_identity_bc_leaves_tile_as_is():
 
 
 # ---------------------------------------------------------------------------
-# stamp_pattern: per-pixel paper-grain for shaped brush path
-# (clip-tools fork #44 Phase 2, kakidashi-kun #84 continuation)
+# stamp_pattern: α-capped silhouette density model for shaped brush path
+# (clip-tools fork #49, kakidashi-kun #96 continuation)
 #
-# Phase 1 only attached grain to the disc-stamped branch of
-# ``render_vector_line_stamp``; shaped brushes (``pattern_style > 0``) still
-# stamped at full coverage via ``stamp_pattern`` writing straight to ``buf``.
-# For Y4_13_302_GSA_systemtest LOSS/A2 nuri, shaped brush 10949 laid yellow
-# at ~1.147× PSD saturation. The fix: let ``stamp_pattern`` accept a grain
-# plane and multiply ``src_a`` by it per-pixel, same mechanism as the disc
-# path's ``stroke_alpha *= grain``.
+# For Y4_13_302_GSA_systemtest LOSS/A2 nuri, shaped brush 10949 (dessin
+# pencil) laid yellow visibly fainter than CSP native output. Root cause:
+# straight porter-duff OVER accumulation never saturates when many soft
+# stamps are stacked, so the yellow silhouette stays translucent. Fix:
+# ``stamp_pattern`` writes a flat silhouette — every pixel whose incoming
+# stamp alpha exceeds ``STAMP_PAINT_THRESHOLD`` takes the brush color at
+# ``STAMP_ALPHA_CAP`` alpha. Per-pixel paper grain still multiplies
+# ``src_a`` before the threshold, so a grain plane now modulates
+# *whether* a pixel crosses threshold rather than its final alpha.
 # ---------------------------------------------------------------------------
 
 
-def _stamp_pattern_baseline_vs_grain(grain_value: float):
-    """Compare a single ``stamp_pattern`` call with vs. without a uniform
-    ``grain`` patch. Returns ``(alpha_no_grain, alpha_with_grain)``."""
-    # 40×40 destination buffer, straight-alpha RGBA, initially empty.
-    buf_no = np.zeros((40, 40, 4), dtype=np.float32)
-    buf_yes = np.zeros((40, 40, 4), dtype=np.float32)
-    # 6×6 fully-opaque pattern mask — a square nib stamp.
-    tex_mask = np.full((6, 6), 255, dtype=np.uint8)
-    # Uniform grain patch over the full buffer, origin=(0, 0).
-    grain = np.full((40, 40), grain_value, dtype=np.float32)
-    kwargs = dict(
-        buffer=buf_no,
-        tex_mask=tex_mask,
-        cx=20.0,
-        cy=20.0,
-        size_x=10.0,
-        size_y=10.0,
-        opacity=0.5,
-        color=(255, 0, 0),
-        rotation_rad=0.0,
-    )
-    stamp_pattern(**kwargs)
-    kwargs.update(buffer=buf_yes, grain=grain, grain_origin=(0, 0))
-    stamp_pattern(**kwargs)
-    return buf_no[..., 3], buf_yes[..., 3]
-
-
-def test_stamp_pattern_with_uniform_half_grain_halves_coverage():
-    # Grain=0.5 over an opaque stamp must halve the per-pixel coverage
-    # vs a baseline stamp with no grain. This is the fundamental hook
-    # the shaped-brush fix relies on.
-    alpha_no, alpha_yes = _stamp_pattern_baseline_vs_grain(0.5)
-    # Only compare pixels where the baseline stamp actually painted.
-    mask = alpha_no > 1e-4
-    assert mask.any(), "baseline stamp must paint at least one pixel"
-    assert np.allclose(alpha_yes[mask], alpha_no[mask] * 0.5, atol=1e-5)
-
-
-def test_stamp_pattern_with_grain_ones_matches_no_grain():
-    # Grain identity (all 1.0) must bit-match the no-grain baseline so
-    # that opt-ing shaped brushes WITHOUT a texture_pattern into this
-    # path (grain=None) stays a no-op.
-    alpha_no, alpha_yes = _stamp_pattern_baseline_vs_grain(1.0)
-    assert np.allclose(alpha_yes, alpha_no, atol=1e-6)
-
-
-def test_stamp_pattern_grain_origin_maps_to_buffer_coords():
-    # Grain is laid out in BUFFER coords with its [0, 0] cell at
-    # ``grain_origin``. Shift the origin so the grain's half-attenuation
-    # band lines up with the right half of the stamp, and assert only
-    # the right-half pixels got halved.
-    buf_left = np.zeros((40, 40, 4), dtype=np.float32)
-    buf_right = np.zeros((40, 40, 4), dtype=np.float32)
-    tex_mask = np.full((6, 6), 255, dtype=np.uint8)
-    # Grain: left half = 1.0 (no attenuation), right half = 0.25.
-    grain = np.ones((40, 40), dtype=np.float32)
-    grain[:, 20:] = 0.25
+def _stamp_once(
+    *,
+    buffer_shape=(40, 40),
+    tex_value=255,
+    opacity=0.5,
+    color=(255, 0, 0),
+    grain=None,
+    grain_origin=(0, 0),
+):
+    """Run one ``stamp_pattern`` call with the standard 6×6 nib centred in a
+    40×40 buffer. Returns the RGBA buffer."""
+    buf = np.zeros((*buffer_shape, 4), dtype=np.float32)
+    tex_mask = np.full((6, 6), tex_value, dtype=np.uint8)
     stamp_pattern(
-        buf_left,
+        buf,
         tex_mask,
         20.0,
         20.0,
         10.0,
         10.0,
-        0.6,
-        (0, 255, 0),
+        opacity,
+        color,
         grain=grain,
-        grain_origin=(0, 0),
+        grain_origin=grain_origin,
     )
-    # No grain comparator — use a second stamp with grain=None.
-    buf_none = np.zeros((40, 40, 4), dtype=np.float32)
-    stamp_pattern(buf_none, tex_mask, 20.0, 20.0, 10.0, 10.0, 0.6, (0, 255, 0))
-    a_left = buf_left[..., 3]
-    a_none = buf_none[..., 3]
-    # Left-half painted pixels must be unchanged; right-half pixels must
-    # read ~0.25× the no-grain baseline.
-    mask_l = (a_none > 1e-4) & (np.arange(40)[None, :] < 20)
-    mask_r = (a_none > 1e-4) & (np.arange(40)[None, :] >= 20)
-    assert mask_l.any() and mask_r.any()
-    assert np.allclose(a_left[mask_l], a_none[mask_l], atol=1e-5)
-    assert np.allclose(a_left[mask_r], a_none[mask_r] * 0.25, atol=1e-5)
+    return buf
+
+
+def test_stamp_pattern_paints_flat_alpha_cap_where_src_above_threshold():
+    # Silhouette contract: every pixel the stamp covers above threshold
+    # takes alpha = STAMP_ALPHA_CAP, regardless of the source value. A
+    # fully-opaque tex × 0.5 opacity = 0.5 src_a is well above threshold,
+    # so painted pixels must be exactly 1.0 — not 0.5.
+    buf = _stamp_once(opacity=0.5)
+    alpha = buf[..., 3]
+    painted = alpha > 0
+    assert painted.any(), "stamp must paint at least one pixel"
+    assert np.allclose(alpha[painted], STAMP_ALPHA_CAP, atol=1e-6)
+
+
+def test_stamp_pattern_paints_flat_brush_color_where_src_above_threshold():
+    # Silhouette contract: painted pixels take the brush color verbatim,
+    # not a blended value. Dst starts transparent, so this means exact
+    # (color / 255) in each channel.
+    buf = _stamp_once(opacity=0.5, color=(255, 128, 64))
+    painted = buf[..., 3] > 0
+    assert painted.any()
+    for ch, ref in enumerate((255 / 255.0, 128 / 255.0, 64 / 255.0)):
+        assert np.allclose(buf[..., ch][painted], ref, atol=1e-6)
+
+
+def test_stamp_pattern_leaves_buffer_untouched_where_src_below_threshold():
+    # Low opacity drops src_a below threshold everywhere → nothing is
+    # written, buffer stays zero. This is what gates the collateral spread
+    # seen with the earlier threshold=0.02 experiment: edge pixels where
+    # the tex mask tapers to near-zero must not latch on.
+    tiny_opacity = STAMP_PAINT_THRESHOLD / 2.0  # 0.05 with threshold 0.1
+    buf = _stamp_once(opacity=tiny_opacity)
+    assert not (buf > 0).any()
+
+
+def test_stamp_pattern_grain_can_push_src_below_threshold():
+    # Grain multiplies src_a before the threshold test. A high-coverage
+    # stamp (src_a ~ 0.5) paints the whole nib footprint; same stamp with
+    # grain = 0.1 drops src_a to 0.05 < threshold → no pixel is painted.
+    full_coverage = _stamp_once(opacity=0.5, grain=None)
+    grain = np.full((40, 40), 0.1, dtype=np.float32)
+    starved = _stamp_once(opacity=0.5, grain=grain)
+    assert (full_coverage[..., 3] > 0).any(), "baseline must paint"
+    assert not (starved[..., 3] > 0).any()
+
+
+def test_stamp_pattern_grain_origin_maps_to_buffer_coords_under_silhouette():
+    # Grain is laid out in BUFFER coords at ``grain_origin``. With left
+    # half grain=1.0 and right half grain=0.05, src_a crosses threshold
+    # only on the left — the right half of the stamp must stay unpainted.
+    grain = np.ones((40, 40), dtype=np.float32)
+    grain[:, 20:] = 0.05  # 0.5 × 0.05 = 0.025 < threshold 0.1
+    buf = _stamp_once(opacity=0.5, grain=grain, grain_origin=(0, 0))
+    no_grain = _stamp_once(opacity=0.5)
+    cols = np.arange(40)
+    painted_baseline = no_grain[..., 3] > 0
+    left_baseline = painted_baseline & (cols[None, :] < 20)
+    right_baseline = painted_baseline & (cols[None, :] >= 20)
+    assert left_baseline.any() and right_baseline.any()
+    # Left half: same alpha as baseline (silhouette = 1.0 on both)
+    assert np.allclose(buf[..., 3][left_baseline], STAMP_ALPHA_CAP, atol=1e-6)
+    # Right half: grain starved it — no paint
+    assert not (buf[..., 3][right_baseline] > 0).any()
+
+
+def test_stamp_pattern_alpha_cap_does_not_reduce_existing_alpha():
+    # The silhouette write uses ``np.maximum(dst_a, cap)`` so pre-existing
+    # alpha is preserved when it already exceeds the cap. With cap=1.0
+    # (the production value) this is only the equality edge case, but the
+    # ``maximum`` guarantee matters if the cap is ever lowered.
+    buf = np.zeros((40, 40, 4), dtype=np.float32)
+    buf[..., 3] = 1.0  # pre-painted dst already at cap
+    stamp_pattern(
+        buf,
+        np.full((6, 6), 255, dtype=np.uint8),
+        20.0,
+        20.0,
+        10.0,
+        10.0,
+        0.5,
+        (0, 255, 0),
+    )
+    # Alpha stays exactly at the cap; never dips below.
+    assert float(buf[..., 3].min()) >= STAMP_ALPHA_CAP - 1e-6
 
 
 def _mk_shaped_brush(
@@ -848,31 +881,36 @@ def _render_shaped_single_stroke(
 
 
 def test_shaped_path_applies_paper_grain_when_texture_pattern_present(monkeypatch):
-    # With a shaped brush carrying texture_pattern > 0 and a half-value
-    # grain tile, the painted alpha on a single-stamp footprint must come
-    # back at roughly half the no-grain baseline. This is the integration
-    # hook that closes Phase 2 of kakidashi-kun #84 — shaped brush 10949
-    # on the LOSS/A2 nuri was over-saturating because grain never reached
-    # the shaped branch.
-    half_tex = np.full((4, 4), 128, dtype=np.uint8)  # ≈ 0.502 grain
+    # Integration regression (clip-tools fork #44 Phase 2, kakidashi-kun
+    # #84): a shaped brush with ``texture_pattern > 0`` must still have
+    # its per-pixel grain plane plumbed into ``stamp_pattern``. Under the
+    # silhouette density model (#49) grain modulates *coverage area*, not
+    # per-pixel alpha — a grain plane low enough to drop ``src_a`` below
+    # ``STAMP_PAINT_THRESHOLD`` must shrink the painted footprint instead
+    # of attenuating its alpha.
+    sub_threshold_tex = np.full(
+        (4, 4), int(STAMP_PAINT_THRESHOLD * 255 / 2), dtype=np.uint8
+    )
     img_no_grain = _render_shaped_single_stroke(
         monkeypatch, texture_pattern=0, grain_tex=None
     )
     img_with_grain = _render_shaped_single_stroke(
-        monkeypatch, texture_pattern=99, grain_tex=half_tex
+        monkeypatch, texture_pattern=99, grain_tex=sub_threshold_tex
     )
     a_no = img_no_grain[..., 3].astype(np.float32)
     a_yes = img_with_grain[..., 3].astype(np.float32)
-    mask = a_no > 10  # compare on pixels the baseline stroke actually painted
-    assert mask.sum() > 20, (
-        f"expected the test stroke to paint a visible footprint "
-        f"(got {int(mask.sum())} painted pixels)"
+    painted_no = (a_no > 10).sum()
+    painted_yes = (a_yes > 10).sum()
+    assert painted_no > 20, (
+        f"baseline stroke must paint a visible footprint "
+        f"(got {int(painted_no)} painted pixels)"
     )
-    # 128/255 ≈ 0.502; allow slack for CLIP's floor(alpha*256) step +
-    # supersample reduce quantisation on single-stamp coverage.
-    ratio = a_yes[mask].mean() / a_no[mask].mean()
-    assert 0.40 < ratio < 0.60, (
-        f"shaped-path grain did not attenuate as expected; ratio={ratio:.3f}"
+    # Grain below threshold starves the stroke: the painted footprint
+    # must shrink substantially. If grain were skipped, both counts
+    # would match and the shaped-path grain path would be silently dead.
+    assert painted_yes < painted_no * 0.5, (
+        f"shaped-path grain did not shrink the painted footprint; "
+        f"no_grain={int(painted_no)} with_grain={int(painted_yes)}"
     )
 
 
