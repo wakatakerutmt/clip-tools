@@ -735,6 +735,19 @@ def test_stamp_pattern_grain_can_push_src_below_threshold():
     assert not (starved[..., 3] > 0).any()
 
 
+def test_stamp_pattern_grain_ones_matches_no_grain():
+    # Identity-grain regression (pre-silhouette heritage): a grain plane
+    # filled with 1.0 must be bit-exact equivalent to passing grain=None,
+    # so any future refactor that inverts the sign of the grain multiply,
+    # reassigns ``src_a`` instead of multiplying, or reorders the grain
+    # step with the threshold check is caught immediately rather than
+    # via downstream fixture diff.
+    grain_ones = np.ones((40, 40), dtype=np.float32)
+    buf_grain = _stamp_once(opacity=0.5, grain=grain_ones)
+    buf_none = _stamp_once(opacity=0.5)
+    assert np.array_equal(buf_grain, buf_none)
+
+
 def test_stamp_pattern_grain_origin_maps_to_buffer_coords_under_silhouette():
     # Grain is laid out in BUFFER coords at ``grain_origin``. With left
     # half grain=1.0 and right half grain=0.05, src_a crosses threshold
@@ -754,25 +767,34 @@ def test_stamp_pattern_grain_origin_maps_to_buffer_coords_under_silhouette():
     assert not (buf[..., 3][right_baseline] > 0).any()
 
 
-def test_stamp_pattern_alpha_cap_does_not_reduce_existing_alpha():
-    # The silhouette write uses ``np.maximum(dst_a, cap)`` so pre-existing
-    # alpha is preserved when it already exceeds the cap. With cap=1.0
-    # (the production value) this is only the equality edge case, but the
-    # ``maximum`` guarantee matters if the cap is ever lowered.
-    buf = np.zeros((40, 40, 4), dtype=np.float32)
-    buf[..., 3] = 1.0  # pre-painted dst already at cap
-    stamp_pattern(
-        buf,
-        np.full((6, 6), 255, dtype=np.uint8),
-        20.0,
-        20.0,
-        10.0,
-        10.0,
-        0.5,
-        (0, 255, 0),
+def test_stamp_pattern_mixed_mask_edge_tapers_to_unpainted():
+    # Previous tests drive the stamp with all-above or all-below inputs —
+    # the silhouette edge geometry (where the mask boundary actually lands
+    # inside a stamp footprint) is never exercised. The baseline 6×6 nib
+    # at (20, 20) size 10×10 paints cols 15..24 inclusive; put a grain
+    # ramp across the buffer so that within those cols src_a crosses the
+    # 0.1 threshold mid-footprint, and assert the painted / unpainted
+    # split follows the ramp monotonically (any off-by-one or
+    # rotation-bounds shift of the mask boundary moves the split).
+    ramp = np.linspace(0.5, 0.0, 40, dtype=np.float32)
+    grain = np.broadcast_to(ramp[None, :], (40, 40)).copy()
+    buf = _stamp_once(opacity=0.5, grain=grain, grain_origin=(0, 0))
+    no_grain = _stamp_once(opacity=0.5)
+    footprint = no_grain[..., 3] > 0  # cols 15..24
+    painted = buf[..., 3] > 0
+    unpainted_in_footprint = footprint & ~painted
+    assert painted.any() and unpainted_in_footprint.any(), (
+        "mixed grain must both paint and leave unpainted pixels inside the footprint"
     )
-    # Alpha stays exactly at the cap; never dips below.
-    assert float(buf[..., 3].min()) >= STAMP_ALPHA_CAP - 1e-6
+    painted_cols = np.where(painted)[1]
+    unpainted_cols = np.where(unpainted_in_footprint)[1]
+    # Ramp is monotonically decreasing left→right, so every painted col
+    # sits strictly left of every unpainted-in-footprint col.
+    assert painted_cols.max() < unpainted_cols.min(), (
+        f"mask boundary is not monotonic along the ramp "
+        f"(painted max col {int(painted_cols.max())}, "
+        f"unpainted min col {int(unpainted_cols.min())})"
+    )
 
 
 def _mk_shaped_brush(
@@ -886,31 +908,37 @@ def test_shaped_path_applies_paper_grain_when_texture_pattern_present(monkeypatc
     # its per-pixel grain plane plumbed into ``stamp_pattern``. Under the
     # silhouette density model (#49) grain modulates *coverage area*, not
     # per-pixel alpha — a grain plane low enough to drop ``src_a`` below
-    # ``STAMP_PAINT_THRESHOLD`` must shrink the painted footprint instead
-    # of attenuating its alpha.
-    sub_threshold_tex = np.full(
+    # ``STAMP_PAINT_THRESHOLD`` must shrink the painted footprint relative
+    # to the same path with a grain plane that stays above threshold.
+    #
+    # Both runs set ``texture_pattern=99`` so render_vector_line_stamp
+    # takes the same branch; only the grain tile values change. That
+    # keeps the test's regression axis on grain *values*, not on grain
+    # *plumbing being present at all*.
+    grain_above = np.full((4, 4), 255, dtype=np.uint8)  # 1.0
+    grain_below = np.full(
         (4, 4), int(STAMP_PAINT_THRESHOLD * 255 / 2), dtype=np.uint8
+    )  # ~0.05
+    img_above = _render_shaped_single_stroke(
+        monkeypatch, texture_pattern=99, grain_tex=grain_above
     )
-    img_no_grain = _render_shaped_single_stroke(
-        monkeypatch, texture_pattern=0, grain_tex=None
+    img_below = _render_shaped_single_stroke(
+        monkeypatch, texture_pattern=99, grain_tex=grain_below
     )
-    img_with_grain = _render_shaped_single_stroke(
-        monkeypatch, texture_pattern=99, grain_tex=sub_threshold_tex
-    )
-    a_no = img_no_grain[..., 3].astype(np.float32)
-    a_yes = img_with_grain[..., 3].astype(np.float32)
-    painted_no = (a_no > 10).sum()
-    painted_yes = (a_yes > 10).sum()
-    assert painted_no > 20, (
-        f"baseline stroke must paint a visible footprint "
-        f"(got {int(painted_no)} painted pixels)"
+    a_above = img_above[..., 3].astype(np.float32)
+    a_below = img_below[..., 3].astype(np.float32)
+    painted_above = (a_above > 10).sum()
+    painted_below = (a_below > 10).sum()
+    assert painted_above > 20, (
+        f"baseline stroke (grain=1.0) must paint a visible footprint "
+        f"(got {int(painted_above)} painted pixels)"
     )
     # Grain below threshold starves the stroke: the painted footprint
-    # must shrink substantially. If grain were skipped, both counts
-    # would match and the shaped-path grain path would be silently dead.
-    assert painted_yes < painted_no * 0.5, (
+    # must shrink substantially. If grain were ignored entirely (e.g. not
+    # plumbed into stamp_pattern), both counts would match.
+    assert painted_below < painted_above * 0.5, (
         f"shaped-path grain did not shrink the painted footprint; "
-        f"no_grain={int(painted_no)} with_grain={int(painted_yes)}"
+        f"grain_above={int(painted_above)} grain_below={int(painted_below)}"
     )
 
 
