@@ -1031,3 +1031,154 @@ def test_ss_reduce_preserves_edge_color_at_low_alpha(monkeypatch):
     assert g == 0 and b == 0, f"edge pixel bled color: g={g} b={b}"
     # Alpha averages across the 2×2 tile normally.
     assert 5 <= a <= 7, f"edge pixel alpha wrong: a={a}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #51: text-raster layer with offscreen-format raster
+# ---------------------------------------------------------------------------
+#
+# When CSP stores a text layer's raster in "offscreen" format (raster shape
+# exceeds canvas size), the text pixels are already baked into the raster
+# at absolute canvas coordinates. The pre-fix bbox code wrongly offset the
+# raster by ``meta.layer_offset_x + attr.general_offset_x + meta.layer_offset_x``
+# (meta.layer_offset_x applied twice, plus the text-attrs general offset which
+# describes the text's position INSIDE the raster, not where to place the raster).
+#
+# The fix: for text layers whose raster shape exceeds canvas size, return
+# bbox (0, 0, 0, 0) — the raster is already in canvas coords.
+#
+# Reproducer fixture is a text layer with:
+#   meta.layer_offset_x = 110, meta.layer_offset_y = -12
+#   meta.layer_render_offscr_offset_x = -110 (negates layer_offset_x)
+#   attr.general_offset_x = 263
+#   raster shape (h=2304, w=2560)
+#   canvas (h=2150, w=2338) — raster strictly larger
+
+
+def _mk_text_layer_shim(
+    *,
+    meta_offset_xy=(110, -12),
+    render_offscr_xy=(-110, 12),
+    draw_to_render_offscreen_type=40.0,
+    general_offset_xy=(263, 175),
+    raster_shape=(2304, 2560, 4),
+    canvas_hw=(2150, 2338),
+    layer_id=81,
+):
+    meta = types.SimpleNamespace(
+        text_layer_type=0.0,
+        text_layer_attributes=b"stub",
+        layer_offset_x=meta_offset_xy[0],
+        layer_offset_y=meta_offset_xy[1],
+        layer_render_offscr_offset_x=render_offscr_xy[0],
+        layer_render_offscr_offset_y=render_offscr_xy[1],
+        draw_to_render_offscreen_type=draw_to_render_offscreen_type,
+    )
+    text_attrs = types.SimpleNamespace(
+        general_offset_x=general_offset_xy[0],
+        general_offset_y=general_offset_xy[1],
+    )
+    entry = types.SimpleNamespace(
+        type="raster",
+        image=np.zeros(raster_shape, dtype=np.uint8) if raster_shape else None,
+    )
+    shim = types.SimpleNamespace()
+    shim.metadata = meta
+    shim._text_attrs = text_attrs
+    shim._raster = {layer_id: entry}
+    shim._canvas_size = canvas_hw
+    shim.layer_id = layer_id
+    return shim
+
+
+def test_bbox_text_layer_offscreen_raster_returns_zero_offset():
+    """Issue #51: a text layer whose raster is larger than the canvas has
+    its text pre-baked at absolute canvas coords; bbox must be (0, 0, 0, 0)."""
+    shim = _mk_text_layer_shim()
+    bbox = ClipLayer.bbox.fget(shim)
+    assert bbox == (0, 0, 0, 0), (
+        f"offscreen-raster text layer must land at canvas origin; got {bbox}"
+    )
+
+
+def test_bbox_text_layer_canvas_sized_raster_uses_offsets():
+    """A text layer whose raster fits within the canvas is tightly cropped
+    and does still need the offset arithmetic (not the offscreen bugfix path).
+
+    The expected offset is (meta.layer_offset_x + attr.general_offset_x +
+    meta.layer_offset_x) = 2×110 + 263 — the ORIGINAL (buggy) formula. This
+    test pins that behavior so the bugfix stays scoped to offscreen rasters;
+    a wider fix would need a fixture that proves it with pixel-level parity.
+    """
+    shim = _mk_text_layer_shim(
+        raster_shape=(2150, 2338, 4),  # canvas size exactly → not offscreen
+    )
+    bbox = ClipLayer.bbox.fget(shim)
+    assert bbox[0] == 2 * 110 + 263, f"canvas-raster text layer offset: {bbox}"
+
+
+def test_bbox_text_layer_no_raster_falls_through_to_offset_path():
+    """A text layer with no raster (vanished entry) must not crash on the
+    offscreen check — it should fall through to the pre-existing branch."""
+    shim = _mk_text_layer_shim()
+    shim._raster = {}  # no entry for this layer_id
+    bbox = ClipLayer.bbox.fget(shim)
+    # Not offscreen → original offset formula applies
+    assert bbox[0] == 2 * 110 + 263
+
+
+def test_bbox_text_layer_offscreen_when_only_one_axis_larger():
+    """A raster that is larger than canvas on only one axis still counts as
+    offscreen (CSP may pad one dimension when text runs wide)."""
+    # Wider only
+    shim = _mk_text_layer_shim(raster_shape=(2150, 3000, 4))
+    assert ClipLayer.bbox.fget(shim) == (0, 0, 0, 0)
+    # Taller only
+    shim = _mk_text_layer_shim(raster_shape=(3000, 2338, 4))
+    assert ClipLayer.bbox.fget(shim) == (0, 0, 0, 0)
+
+
+def test_bbox_non_text_layer_unaffected_by_offscreen_check():
+    """A non-text layer with an offscreen raster still goes through the
+    non-text branch of bbox and uses meta.layer_offset_x only — the
+    offscreen check must NOT trip for these."""
+    shim = _mk_text_layer_shim()
+    shim.metadata = types.SimpleNamespace(
+        text_layer_type=None,
+        text_layer_attributes=None,
+        layer_offset_x=-256,
+        layer_offset_y=-256,
+        layer_render_offscr_offset_x=0,
+        layer_render_offscr_offset_y=0,
+        draw_to_render_offscreen_type=40.0,
+    )
+    bbox = ClipLayer.bbox.fget(shim)
+    assert bbox == (-256, -256, 0, 0), bbox
+
+
+def test_offscreen_text_raster_placed_at_identity_end_to_end():
+    """E2E: bbox + _place_raster_on_canvas together must place an offscreen
+    text raster's pixels at identity (raster-local coord == canvas coord).
+
+    Catches regressions anywhere along the pipeline from ``ClipLayer.bbox``
+    through ``bbox[:2]`` → ``_place_raster_on_canvas(offset_xy=bbox[:2])``,
+    not just the bbox formula pinned by the unit tests above. Mirrors the
+    Y4_13_302 / ep#13 fixture: a raster whose shape exceeds canvas, with
+    text pre-baked at absolute canvas coordinates. The pre-fix formula
+    would place a raster-local (400, 200) pixel at canvas (883, 351)
+    instead of the expected (400, 200).
+    """
+    from clip_tools.composite.compositor import _place_raster_on_canvas
+
+    shim = _mk_text_layer_shim()
+    # uint8 255 scales to float32 1.0 exactly in _place_raster_on_canvas.
+    raster = shim._raster[shim.layer_id].image
+    raster[200, 400] = (255, 255, 255, 255)
+
+    bbox = ClipLayer.bbox.fget(shim)
+    canvas = _place_raster_on_canvas(raster, shim._canvas_size, bbox[:2])
+    # Canvas is (H, W, 4); indexed as [y, x, c].
+    assert canvas[200, 400, 3] == 1.0, (
+        f"raster-local (400, 200) must land at canvas (400, 200); "
+        f"got alpha={canvas[200, 400, 3]}, bbox={bbox}"
+    )
