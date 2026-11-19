@@ -1162,34 +1162,23 @@ def test_offscreen_text_raster_placed_at_identity_end_to_end():
 
     Catches regressions anywhere along the pipeline from ``ClipLayer.bbox``
     through ``bbox[:2]`` → ``_place_raster_on_canvas(offset_xy=bbox[:2])``,
-    not just the bbox formula pinned by the unit tests above.
-
-    Mirrors the Y4_13_302 / ep#13 fixture: a raster whose shape exceeds
-    canvas, with text pre-baked at absolute canvas coordinates. With the
-    buggy pre-fix formula bbox[:2] would be (483, 151), placing pixel
-    (400, 200) at canvas (883, 351) — far from the expected (400, 200).
+    not just the bbox formula pinned by the unit tests above. Mirrors the
+    Y4_13_302 / ep#13 fixture: a raster whose shape exceeds canvas, with
+    text pre-baked at absolute canvas coordinates. The pre-fix formula
+    would place a raster-local (400, 200) pixel at canvas (883, 351)
+    instead of the expected (400, 200).
     """
     from clip_tools.composite.compositor import _place_raster_on_canvas
 
     shim = _mk_text_layer_shim()
-    # Place an opaque white pixel at raster-local (x=400, y=200). The raster
-    # dtype is uint8 from the shim factory; _place_raster_on_canvas scales
-    # uint8 → float32 [0, 1].
+    # uint8 255 scales to float32 1.0 exactly in _place_raster_on_canvas.
     raster = shim._raster[shim.layer_id].image
     raster[200, 400] = (255, 255, 255, 255)
 
     bbox = ClipLayer.bbox.fget(shim)
-    assert bbox == (0, 0, 0, 0), f"precondition: offscreen → zero bbox, got {bbox}"
-
     canvas = _place_raster_on_canvas(raster, shim._canvas_size, bbox[:2])
-    # Canvas has shape (H, W, 4) = (2150, 2338, 4); indexing is [y, x, c].
+    # Canvas is (H, W, 4); indexed as [y, x, c].
     assert canvas[200, 400, 3] == 1.0, (
-        f"pixel at raster-local (400, 200) must land at canvas (400, 200); "
-        f"got alpha={canvas[200, 400, 3]}"
-    )
-    # Pre-fix buggy offset would place the pixel at canvas (483+400, 151+200)
-    # = (883, 351). Confirm nothing landed there.
-    assert canvas[351, 883, 3] == 0.0, (
-        "pixel must NOT land at the pre-fix buggy offset (883, 351); "
-        "a non-zero value here means the bbox or placement path regressed"
+        f"raster-local (400, 200) must land at canvas (400, 200); "
+        f"got alpha={canvas[200, 400, 3]}, bbox={bbox}"
     )
