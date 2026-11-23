@@ -195,15 +195,10 @@ def process_clip_data(
             layer_prefix = layer_metadata.prefix
             layer_folder = layer_metadata.layer_folder
 
-            if layer_metadata.layer_clip != 0:
-                logger.warning(
-                    f"WARNING: Skipping clipped layer: {layer_name} in folder: {layer_prefix}"
-                )
-                auxillary_list.append(
-                    LayerEntry(type="clipped", image=processed_layer_arr)
-                )
-                continue
-
+            # Clipped raster layers go into raster_dict like any other leaf;
+            # the compositor applies the clipping-chain mask at composite
+            # time (see composite.compositor.composite). Previously these
+            # were skipped here, silently dropping their pixels.
             if layer_folder != 0:
                 # Groups cache their composited raster; keep it in raster_dict as
                 # a fallback for when leaf children have no stored pixel data

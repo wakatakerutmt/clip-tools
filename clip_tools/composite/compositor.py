@@ -92,8 +92,25 @@ def composite(
         force=force,
     )
     target = group._children if (_is_group(group) and not as_layer) else [group]
+    # CSP clipping-group (「下のレイヤーでクリッピング」, layer_clip=1): each
+    # clipped sibling is masked by the alpha of the most recent non-clipped
+    # leaf sibling in the same group. Without a leaf chain base — clipped at
+    # the top of a group, or after a group sibling — drop the clipped layer
+    # rather than paint it unmasked (which leaks its full source across the
+    # canvas; see Issue #54 and the mon_01_252 A9/A10 regression).
+    clip_mask_source: Optional[np.ndarray] = None
     for layer in target:
-        compositor.apply(layer)
+        is_clipped = _layer_clip_flag(layer) != 0
+        if is_clipped and clip_mask_source is None:
+            continue
+        compositor.apply(
+            layer,
+            extra_shape_mask=clip_mask_source if is_clipped else None,
+        )
+        if not is_clipped:
+            clip_mask_source = (
+                None if _is_group(layer) else compositor._own_alpha(layer)
+            )
     return compositor.finish()
 
 
@@ -167,7 +184,7 @@ class Compositor:
             self._alpha = alpha.copy()
 
     # ---- Public: apply one child ---------------------------------------
-    def apply(self, layer) -> None:
+    def apply(self, layer, extra_shape_mask: Optional[np.ndarray] = None) -> None:
         if self._layer_filter is not None and not self._layer_filter(layer):
             return
         if not getattr(layer, "visible", True) and not self._force:
@@ -184,6 +201,9 @@ class Compositor:
             return
 
         shape_mask, opacity_mask = self._get_mask(layer)
+        # Clipping-chain mask from the caller (composite() iteration).
+        if extra_shape_mask is not None:
+            shape_mask = shape_mask * extra_shape_mask
         shape_const, opacity_const = self._get_const(layer)
         shape = shape * shape_mask
         alpha = alpha * shape_mask * opacity_mask * opacity_const
@@ -272,6 +292,19 @@ class Compositor:
         vh = self._viewport[3] - self._viewport[1]
         ones = np.ones((vh, vw, 1), dtype=np.float32)
         return ones, ones
+
+    def _own_alpha(self, layer) -> Optional[np.ndarray]:
+        """Return the layer's own source alpha (pre-composite) within the
+        current viewport, or None if it has no raster.
+
+        Used as the clipping-chain mask source so subsequent clipped
+        siblings are masked by this layer's shape, not by the accumulated
+        backdrop under it.
+        """
+        if _is_group(layer):
+            return None
+        _, _, alpha = self._get_object(layer)
+        return alpha
 
     def _get_const(self, layer) -> Tuple[float, float]:
         """(shape_const=fill_opacity, opacity_const=layer_opacity).
@@ -393,6 +426,11 @@ class Compositor:
 
 def _is_group(layer) -> bool:
     return bool(layer.metadata.layer_folder & LayerFolderBit.IS_FOLDER)
+
+
+def _layer_clip_flag(layer) -> int:
+    """CSP's "下のレイヤーでクリッピング" bit. 0 = normal, 1 = clipped."""
+    return int(getattr(layer.metadata, "layer_clip", 0) or 0)
 
 
 def _blend_mode(layer) -> LayerComposite:

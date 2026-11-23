@@ -1182,3 +1182,312 @@ def test_offscreen_text_raster_placed_at_identity_end_to_end():
         f"raster-local (400, 200) must land at canvas (400, 200); "
         f"got alpha={canvas[200, 400, 3]}, bbox={bbox}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #54: CSP clipping-group ("下のレイヤーでクリッピング", layer_clip=1)
+# ---------------------------------------------------------------------------
+#
+# A clipped sibling should be masked by the alpha of the most recent
+# non-clipped leaf sibling in the same group (the "chain base"). Previous
+# behaviour: processing.py skipped clipped raster layers (silent drop), and
+# the vector branch had no such check so clipped vectors rendered unmasked.
+#
+# Fix: keep clipped layers in raster_dict, apply chain mask in
+# compositor.composite() via `extra_shape_mask` on `Compositor.apply()`.
+# When no leaf chain base exists (first child of a group, or the last base
+# was itself a group) the clipped sibling is dropped — safer than
+# rendering it fully unmasked over the canvas.
+
+
+def _mk_leaf_shim(*, image, bbox_xy, canvas_hw, layer_id, visible=True, layer_clip=0):
+    """Minimum ClipLayer-like shim the Compositor can consume.
+
+    `image` is a uint8 (H, W, 4) raster already in canvas coords (the
+    shim's bbox is the raster's top-left offset).
+    """
+    meta = types.SimpleNamespace(
+        layer_folder=0,
+        layer_clip=layer_clip,
+        layer_composite=0,  # NORMAL
+        layer_opacity=256,
+        layer_visibility=1 if visible else 0,
+    )
+    entry = types.SimpleNamespace(type="raster", image=image)
+    shim = types.SimpleNamespace(
+        layer_id=layer_id,
+        metadata=meta,
+        visible=visible,
+        bbox=(bbox_xy[0], bbox_xy[1], image.shape[1], image.shape[0]),
+        _raster={layer_id: entry},
+        _canvas_size=canvas_hw,
+    )
+    return shim
+
+
+def _mk_group_shim(*, children, canvas_hw, layer_id, visible=True, layer_clip=0):
+    meta = types.SimpleNamespace(
+        layer_folder=1,  # IS_FOLDER
+        layer_clip=layer_clip,
+        layer_composite=0,
+        layer_opacity=256,
+        layer_visibility=1 if visible else 0,
+    )
+    shim = types.SimpleNamespace(
+        layer_id=layer_id,
+        metadata=meta,
+        visible=visible,
+        _children=children,
+        _canvas_size=canvas_hw,
+    )
+    return shim
+
+
+def _mk_rect(canvas_hw, x0, y0, x1, y1, rgba):
+    """Create an (H, W, 4) uint8 canvas with a filled rect of ``rgba``."""
+    img = np.zeros((canvas_hw[0], canvas_hw[1], 4), dtype=np.uint8)
+    img[y0:y1, x0:x1] = rgba
+    return img
+
+
+def test_clipping_group_leaf_base_masks_clipped_sibling():
+    """Chain base = leaf raster. Clipped sibling's color only appears where
+    the base has alpha, matching CSP's "下のレイヤーでクリッピング" behaviour.
+    """
+    from clip_tools.composite.compositor import composite
+
+    canvas = (40, 40)  # (H, W)
+    # Base: small opaque blue rect at (10, 10)–(20, 20) — 10×10 inside canvas.
+    base_img = _mk_rect(canvas, 10, 10, 20, 20, (0, 0, 255, 255))
+    base = _mk_leaf_shim(
+        image=base_img,
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=1,
+    )
+    # Clipped sibling: full-canvas opaque red. Without clipping it would
+    # paint everywhere; chain mask must restrict it to the base rect only.
+    clipped_img = _mk_rect(canvas, 0, 0, 40, 40, (255, 0, 0, 255))
+    clipped = _mk_leaf_shim(
+        image=clipped_img,
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=2,
+        layer_clip=1,
+    )
+    grp = _mk_group_shim(children=[base, clipped], canvas_hw=canvas, layer_id=10)
+
+    color, _shape, alpha = composite(grp)
+    # Within base rect: clipped RED wins (NORMAL blend stacks red over blue).
+    assert alpha[15, 15, 0] > 0.9, (
+        f"inside base: alpha should be opaque, got {alpha[15, 15, 0]}"
+    )
+    assert color[15, 15, 0] > 0.9, (
+        f"inside base: red channel should win, got {color[15, 15]}"
+    )
+    assert color[15, 15, 2] < 0.1, (
+        f"inside base: blue should be overwritten by clipped red, got {color[15, 15]}"
+    )
+    # Outside base rect: nothing (clipped got masked, base has no coverage).
+    assert alpha[5, 5, 0] == 0.0, (
+        f"outside base: alpha must be zero, got {alpha[5, 5, 0]}"
+    )
+    assert alpha[30, 30, 0] == 0.0, (
+        f"outside base: alpha must be zero, got {alpha[30, 30, 0]}"
+    )
+
+
+def test_clipping_group_no_base_drops_clipped():
+    """A clipped layer at the top of a group (no leaf base above it) is
+    DROPPED (safer than rendering unmasked across the canvas)."""
+    from clip_tools.composite.compositor import composite
+
+    canvas = (40, 40)
+    clipped_img = _mk_rect(canvas, 0, 0, 40, 40, (255, 0, 0, 255))
+    clipped = _mk_leaf_shim(
+        image=clipped_img,
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=2,
+        layer_clip=1,
+    )
+    grp = _mk_group_shim(children=[clipped], canvas_hw=canvas, layer_id=10)
+
+    color, _shape, alpha = composite(grp)
+    # Everything must be transparent — the clipped layer was dropped.
+    assert float(alpha.max()) == 0.0, (
+        f"no-base clipped must be dropped; got max alpha {alpha.max()}"
+    )
+
+
+def test_clipping_group_non_clipped_sibling_renders_normally():
+    """Non-clipped siblings are unaffected by the chain tracker — they go
+    through the normal blend path."""
+    from clip_tools.composite.compositor import composite
+
+    canvas = (40, 40)
+    base_img = _mk_rect(canvas, 10, 10, 20, 20, (0, 0, 255, 255))
+    base = _mk_leaf_shim(image=base_img, bbox_xy=(0, 0), canvas_hw=canvas, layer_id=1)
+    # A second non-clipped sibling at a DIFFERENT location — must render
+    # normally, not be masked by base.
+    other_img = _mk_rect(canvas, 25, 25, 35, 35, (0, 255, 0, 255))
+    other = _mk_leaf_shim(image=other_img, bbox_xy=(0, 0), canvas_hw=canvas, layer_id=3)
+    grp = _mk_group_shim(children=[base, other], canvas_hw=canvas, layer_id=10)
+
+    _color, _shape, alpha = composite(grp)
+    # Both rects must be opaque.
+    assert alpha[15, 15, 0] > 0.9, "base rect alpha"
+    assert alpha[30, 30, 0] > 0.9, "non-clipped sibling rect alpha"
+
+
+def test_clipping_group_chain_reset_after_non_clipped_sibling():
+    """Pattern [base_A, clipped_to_A, base_B, clipped_to_B] — the second
+    clipped sibling must mask to base_B's alpha, not base_A's."""
+    from clip_tools.composite.compositor import composite
+
+    canvas = (40, 40)
+    # A chain: blue at left; red clipped to blue.
+    base_a = _mk_leaf_shim(
+        image=_mk_rect(canvas, 0, 0, 10, 40, (0, 0, 255, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=1,
+    )
+    clip_to_a = _mk_leaf_shim(
+        image=_mk_rect(canvas, 0, 0, 40, 40, (255, 0, 0, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=2,
+        layer_clip=1,
+    )
+    # B chain: green at right; cyan clipped to green.
+    base_b = _mk_leaf_shim(
+        image=_mk_rect(canvas, 30, 0, 40, 40, (0, 255, 0, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=3,
+    )
+    clip_to_b = _mk_leaf_shim(
+        image=_mk_rect(canvas, 0, 0, 40, 40, (0, 255, 255, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=4,
+        layer_clip=1,
+    )
+    grp = _mk_group_shim(
+        children=[base_a, clip_to_a, base_b, clip_to_b],
+        canvas_hw=canvas,
+        layer_id=10,
+    )
+
+    color, _shape, alpha = composite(grp)
+    # Left strip (base_a's region, x<10): red should win (clip_to_a masked here).
+    assert color[20, 5, 0] > 0.9 and color[20, 5, 1] < 0.1 and color[20, 5, 2] < 0.1, (
+        f"left strip should be red (clipped_to_a over base_a); got {color[20, 5]}"
+    )
+    # Right strip (base_b's region, x>=30): cyan (clip_to_b) should win here.
+    assert (
+        color[20, 35, 1] > 0.9 and color[20, 35, 2] > 0.9 and color[20, 35, 0] < 0.1
+    ), f"right strip should be cyan (clipped_to_b over base_b); got {color[20, 35]}"
+    # Middle (10 <= x < 30): both clipped are masked out, no base here either.
+    assert alpha[20, 20, 0] == 0.0, (
+        f"middle should be transparent; got alpha {alpha[20, 20, 0]}"
+    )
+
+
+def test_clipping_group_two_clipped_siblings_share_same_base():
+    """CSP pattern [base, clipped_1, clipped_2]: both clipped siblings mask
+    to the same base alpha (chain base doesn't advance to the first clipped)."""
+    from clip_tools.composite.compositor import composite
+
+    canvas = (40, 40)
+    base = _mk_leaf_shim(
+        image=_mk_rect(canvas, 10, 10, 20, 20, (0, 0, 255, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=1,
+    )
+    # First clipped sibling — opaque red, would cover canvas without mask.
+    clipped_a = _mk_leaf_shim(
+        image=_mk_rect(canvas, 0, 0, 40, 40, (255, 0, 0, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=2,
+        layer_clip=1,
+    )
+    # Second clipped sibling — opaque green in a different shape that also
+    # extends past the base rect; must ALSO be masked by base, not by clipped_a.
+    clipped_b = _mk_leaf_shim(
+        image=_mk_rect(canvas, 5, 5, 25, 25, (0, 255, 0, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=3,
+        layer_clip=1,
+    )
+    grp = _mk_group_shim(
+        children=[base, clipped_a, clipped_b],
+        canvas_hw=canvas,
+        layer_id=10,
+    )
+
+    color, _shape, alpha = composite(grp)
+    # Inside base rect (10..20): clipped_b (green) wins over clipped_a (red).
+    assert alpha[15, 15, 0] > 0.9, "inside base: should be opaque"
+    assert color[15, 15, 1] > 0.9, f"inside base: green on top; got {color[15, 15]}"
+    assert color[15, 15, 0] < 0.1, (
+        f"inside base: red should be covered; got {color[15, 15]}"
+    )
+    # Outside base rect, inside clipped_b's own extent (e.g. 5..10 or 20..25):
+    # clipped_b's own extent is 5..25, but masked to base (10..20), so (7, 7) is
+    # outside base → must be transparent (clipped_b was masked away).
+    assert alpha[7, 7, 0] == 0.0, (
+        f"clipped_b must mask to base, not to its own extent; got alpha {alpha[7, 7, 0]}"
+    )
+    # Same for (22, 22) — inside clipped_b but outside base.
+    assert alpha[22, 22, 0] == 0.0, (
+        f"clipped_b must mask to base; got alpha {alpha[22, 22, 0]}"
+    )
+
+
+def test_clipping_group_group_base_falls_back_to_drop():
+    """POC gap: when the chain base is a GROUP (not a leaf), the clipped
+    sibling drops (safer fallback). Pins this behaviour so a future proper
+    group-as-base implementation doesn't silently regress elsewhere."""
+    from clip_tools.composite.compositor import composite
+
+    canvas = (40, 40)
+    # A tiny group containing a single leaf as its "visible content".
+    inner_leaf = _mk_leaf_shim(
+        image=_mk_rect(canvas, 10, 10, 20, 20, (0, 0, 255, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=1,
+    )
+    group_base = _mk_group_shim(
+        children=[inner_leaf],
+        canvas_hw=canvas,
+        layer_id=100,
+    )
+    clipped = _mk_leaf_shim(
+        image=_mk_rect(canvas, 0, 0, 40, 40, (255, 0, 0, 255)),
+        bbox_xy=(0, 0),
+        canvas_hw=canvas,
+        layer_id=2,
+        layer_clip=1,
+    )
+    grp = _mk_group_shim(
+        children=[group_base, clipped],
+        canvas_hw=canvas,
+        layer_id=10,
+    )
+
+    color, _shape, alpha = composite(grp)
+    # The group's content (blue rect) is visible as the group composited.
+    assert alpha[15, 15, 0] > 0.9, "group's inner leaf should composite normally"
+    assert color[15, 15, 2] > 0.9, f"group inner is blue; got {color[15, 15]}"
+    # Clipped was dropped (group-as-base POC gap): no red over the blue.
+    assert color[15, 15, 0] < 0.1, (
+        f"clipped red must drop (group-as-base is POC gap); got red={color[15, 15, 0]}"
+    )
+    # Outside the inner leaf: nothing (clipped dropped, group empty here).
+    assert alpha[5, 5, 0] == 0.0, f"outside group: transparent; got {alpha[5, 5, 0]}"
