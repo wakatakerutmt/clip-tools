@@ -1138,22 +1138,95 @@ def test_bbox_text_layer_offscreen_when_only_one_axis_larger():
     assert ClipLayer.bbox.fget(shim) == (0, 0, 0, 0)
 
 
-def test_bbox_non_text_layer_unaffected_by_offscreen_check():
-    """A non-text layer with an offscreen raster still goes through the
-    non-text branch of bbox and uses meta.layer_offset_x only — the
-    offscreen check must NOT trip for these."""
-    shim = _mk_text_layer_shim()
-    shim.metadata = types.SimpleNamespace(
+def _mk_non_text_shim(
+    *,
+    layer_offset_xy=(-7, -56),
+    render_offscr_xy=(7, 56),
+    draw_to_render_offscreen_type=10.0,
+    raster_shape=(2150, 2338, 4),
+    canvas_hw=(2150, 2338),
+    layer_id=616,
+):
+    """Shim for a non-text raster layer (Issue #56 fixtures).
+
+    Defaults reproduce Y4_13_302_GSA_systemtest's ``BG/atari`` raster:
+    canvas-sized raster, symmetric (-7, +7) / (-56, +56) offsets, and a
+    non-None ``draw_to_render_offscreen_type``.
+    """
+    meta = types.SimpleNamespace(
         text_layer_type=None,
         text_layer_attributes=None,
-        layer_offset_x=-256,
-        layer_offset_y=-256,
-        layer_render_offscr_offset_x=0,
-        layer_render_offscr_offset_y=0,
-        draw_to_render_offscreen_type=40.0,
+        layer_offset_x=layer_offset_xy[0],
+        layer_offset_y=layer_offset_xy[1],
+        layer_render_offscr_offset_x=render_offscr_xy[0],
+        layer_render_offscr_offset_y=render_offscr_xy[1],
+        draw_to_render_offscreen_type=draw_to_render_offscreen_type,
+    )
+    entry = types.SimpleNamespace(
+        type="raster",
+        image=np.zeros(raster_shape, dtype=np.uint8) if raster_shape else None,
+    )
+    shim = types.SimpleNamespace()
+    shim.metadata = meta
+    shim._raster = {layer_id: entry}
+    shim._canvas_size = canvas_hw
+    shim.layer_id = layer_id
+    return shim
+
+
+# ---------------------------------------------------------------------------
+# Issue #56: non-text raster bbox when the offscreen has been refreshed
+# ---------------------------------------------------------------------------
+#
+# When ``LayerRecord.draw_to_render_offscreen_type != None`` the raster has
+# already been refreshed and both ``layer_offset_x/y`` AND
+# ``layer_render_offscr_offset_x/y`` live inside it at canvas coordinates.
+# The pre-fix code added ``layer_offset_x`` a second time, producing a net
+# non-zero shift (e.g. -7, -56 for Y4 BG/atari) that leaked a double
+# version of the text and flare band through the BG_Book composite.
+
+
+def test_bbox_non_text_refreshed_offscreen_returns_zero_offset():
+    """Issue #56: a non-text raster with ``draw_to_render_offscreen_type``
+    set has the offsets already baked into its pixels — bbox must be (0,0).
+
+    Mirrors Y4_13_302_GSA_systemtest's ``BG_Book/BG/atari`` layer.
+    """
+    shim = _mk_non_text_shim()
+    bbox = ClipLayer.bbox.fget(shim)
+    assert bbox == (0, 0, 0, 0), (
+        f"refreshed-offscreen raster must land at canvas origin; got {bbox}"
+    )
+
+
+def test_bbox_non_text_dirty_offscreen_still_applies_offsets():
+    """When ``draw_to_render_offscreen_type is None`` the offscreen has NOT
+    been refreshed — ``layer_offset_x/y`` + ``layer_render_offscr_offset_x/y``
+    still live outside the raster and both must be applied.
+
+    Mirrors Y4_13_302_GSA_systemtest's ``BG_Book/BG/bg`` layer (raster
+    2560x2816, canvas 2338x2150, both offsets contribute to -256/-256).
+    """
+    shim = _mk_non_text_shim(
+        layer_offset_xy=(-10, -170),
+        render_offscr_xy=(-246, -86),
+        draw_to_render_offscreen_type=None,
+        raster_shape=(2560, 2816, 4),
     )
     bbox = ClipLayer.bbox.fget(shim)
     assert bbox == (-256, -256, 0, 0), bbox
+
+
+def test_bbox_non_text_refreshed_but_offsets_zero_is_noop():
+    """Sanity: when offsets are already zero, the fix neither adds nor
+    subtracts anything — the result is still (0, 0, 0, 0)."""
+    shim = _mk_non_text_shim(
+        layer_offset_xy=(0, 0),
+        render_offscr_xy=(0, 0),
+        draw_to_render_offscreen_type=40.0,
+    )
+    bbox = ClipLayer.bbox.fget(shim)
+    assert bbox == (0, 0, 0, 0), bbox
 
 
 def test_offscreen_text_raster_placed_at_identity_end_to_end():
