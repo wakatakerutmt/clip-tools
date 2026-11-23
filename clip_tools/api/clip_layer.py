@@ -342,12 +342,34 @@ class ClipLayer:
                 layer_offset_x = meta.layer_offset_x
                 layer_offset_y = meta.layer_offset_y
         else:
+            # Non-text raster. Issue #56: when the offscreen has been
+            # refreshed (draw_to_render_offscreen_type != None), BOTH
+            # layer_render_offscr_offset_x/y AND layer_offset_x/y are
+            # already baked into the raster at canvas coordinates — adding
+            # either one here shifts the raster off-position. For Y4's
+            # BG/atari layer the stored offsets are symmetric (-7, +7) and
+            # (-56, +56), so the "cancellation" only works if both are
+            # treated the same way; otherwise a net -7 / -56 shift leaks
+            # out. When the offscreen is still "dirty" (type is None),
+            # apply both offsets so the untouched raster lands at the
+            # correct position.
+            #
+            # (Issue #51 handles the text-layer flavour of the same bug
+            # via the raster_is_offscreen early return in the branch above
+            # — this guard is just the non-text cousin.)
             layer_offset_x = 0
             layer_offset_y = 0
+            if meta.draw_to_render_offscreen_type is None:
+                layer_offset_x += meta.layer_render_offscr_offset_x
+                layer_offset_y += meta.layer_render_offscr_offset_y
+                layer_offset_x += meta.layer_offset_x
+                layer_offset_y += meta.layer_offset_y
+            return (layer_offset_x, layer_offset_y, 0, 0)
 
-        # Once the layer's offscreen has been refreshed, render-offscreen
-        # offsets are already baked into the offscreen and we shouldn't add
-        # them again. DrawToRenderOffscreenType is the dirty/applied flag.
+        # Text layer path (unchanged). Once the layer's offscreen has
+        # been refreshed, render-offscreen offsets are already baked into
+        # the offscreen and we shouldn't add them again.
+        # DrawToRenderOffscreenType is the dirty/applied flag.
         if meta.draw_to_render_offscreen_type is None:
             layer_offset_x += meta.layer_render_offscr_offset_x
             layer_offset_y += meta.layer_render_offscr_offset_y
